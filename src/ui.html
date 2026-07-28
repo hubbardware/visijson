@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jsondocstore</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230a0f0d'/%3E%3Ctext x='8' y='12' font-family='monospace' font-size='11' font-weight='bold' fill='%233fe08f' text-anchor='middle'%3E%7B%7D%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0a0f0d;
+    --panel: #0f1614;
+    --panel-deep: #0c1210;
+    --line: #1e2b26;
+    --line-bright: #2c4038;
+    --text: #cfe0d8;
+    --dim: #64786f;
+    --faint: #42534c;
+    --green: #3fe08f;
+    --green-glow: rgba(63, 224, 143, 0.45);
+    --amber: #ffb454;
+    --red: #ff6b6b;
+    --blue: #6fb3ff;
+    --mono: "Berkeley Mono", "JetBrains Mono", "Cascadia Code", "Fira Code",
+            "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(120% 90% at 50% 0%, #101b16 0%, var(--bg) 55%);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    overflow: hidden;
+  }
+  /* faint CRT scanlines over everything */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom, transparent 0 2px, rgba(0, 0, 0, 0.14) 2px 3px);
+    mix-blend-mode: multiply;
+  }
+
+  .app { display: flex; flex-direction: column; height: 100%; }
+
+  /* ---------------------------------------------------- header */
+  header {
+    display: flex; align-items: center; gap: 18px;
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(to bottom, #121a17, #0e1513);
+    animation: dropIn 0.45s ease both;
+  }
+  .wordmark {
+    font-size: 13px; font-weight: 700;
+    letter-spacing: 0.35em; text-transform: uppercase;
+    color: var(--green);
+    text-shadow: 0 0 12px var(--green-glow);
+    white-space: nowrap; user-select: none;
+  }
+  .wordmark .dim-mark { color: var(--faint); text-shadow: none; }
+
+  .crumbs {
+    flex: 1; display: flex; align-items: center; flex-wrap: wrap;
+    gap: 2px; min-width: 0;
+    font-size: 13px;
+    padding: 4px 10px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--panel-deep);
+    box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.45);
+  }
+  .crumbs a {
+    color: var(--blue); text-decoration: none; padding: 0 2px;
+  }
+  .crumbs a:hover { color: var(--green); text-shadow: 0 0 8px var(--green-glow); }
+  .crumbs .sep { color: var(--faint); }
+  .crumbs .cursor {
+    display: inline-block; width: 7px; height: 15px;
+    background: var(--green); margin-left: 4px; vertical-align: text-bottom;
+    animation: blink 1.1s steps(1) infinite;
+  }
+
+  .status { display: flex; align-items: center; gap: 14px; white-space: nowrap; }
+  .led {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--red); transition: background 0.3s;
+  }
+  .led.on {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green-glow), 0 0 18px var(--green-glow);
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  .status .label { color: var(--dim); text-transform: uppercase; letter-spacing: 0.14em; font-size: 10px; }
+  .ver {
+    color: var(--amber); font-size: 13px; min-width: 5ch; text-align: right;
+  }
+  .ver.tick { animation: pop 0.35s ease; }
+
+  /* ---------------------------------------------------- layout */
+  main {
+    flex: 1; display: grid; grid-template-columns: 1fr 330px;
+    gap: 14px; padding: 14px 18px 18px; min-height: 0;
+  }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+
+  .panel {
+    display: flex; flex-direction: column; min-height: 0; min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: linear-gradient(to bottom, var(--panel), var(--panel-deep));
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    animation: rise 0.5s ease both;
+  }
+  .panel:nth-child(2) { animation-delay: 0.08s; }
+  .panel-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    color: var(--dim);
+    font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+    user-select: none;
+  }
+  .panel-head .spacer { flex: 1; }
+
+  button {
+    font: inherit; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--dim); background: transparent;
+    border: 1px solid var(--line-bright); border-radius: 3px;
+    padding: 3px 10px; cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, box-shadow 0.15s;
+  }
+  button:hover { color: var(--green); border-color: var(--green); box-shadow: 0 0 10px var(--green-glow); }
+  button.danger:hover { color: var(--red); border-color: var(--red); box-shadow: 0 0 10px rgba(255, 107, 107, 0.4); }
+
+  /* ---------------------------------------------------- tree view */
+  .view { flex: 1; overflow: auto; padding: 12px 8px; }
+  .row {
+    display: flex; align-items: baseline;
+    padding: 1px 10px 1px calc(10px + var(--d) * 18px);
+    border-left: 2px solid transparent;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .row:hover { background: rgba(63, 224, 143, 0.05); }
+  .row.flash { animation: flashRow 1.4s ease-out; border-left-color: var(--amber); }
+  .k { color: var(--blue); text-decoration: none; }
+  .k:hover { color: var(--green); text-shadow: 0 0 8px var(--green-glow); }
+  .p { color: var(--faint); }
+  .v-str { color: var(--green); }
+  .v-num { color: var(--amber); }
+  .v-bool { color: var(--blue); }
+  .v-null { color: var(--dim); font-style: italic; }
+  .v-err { color: var(--red); text-shadow: 0 0 8px rgba(255, 107, 107, 0.5); }
+  .editable { cursor: pointer; border-bottom: 1px dotted var(--faint); }
+  .editable:hover { border-bottom-color: var(--green); }
+  .inline-input {
+    font: inherit; color: var(--amber);
+    background: var(--panel-deep);
+    border: 1px solid var(--green); border-radius: 2px;
+    outline: none; padding: 0 4px; min-width: 12ch;
+  }
+  .empty-doc { color: var(--dim); padding: 18px 14px; font-style: italic; }
+
+  /* ---------------------------------------------------- editor */
+  .editor { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  .editor.active { display: flex; }
+  .view.hidden { display: none; }
+  .editor textarea {
+    flex: 1; resize: none;
+    font: inherit; color: var(--text);
+    background: var(--panel-deep);
+    border: none; outline: none;
+    padding: 12px 14px;
+    box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.5);
+  }
+  .stale-note {
+    display: none;
+    padding: 6px 12px;
+    color: var(--amber);
+    border-top: 1px dashed var(--line-bright);
+    font-size: 11px;
+  }
+  .stale-note.show { display: block; animation: flashRow 1.4s ease-out; }
+
+  /* ---------------------------------------------------- event log */
+  .log { flex: 1; overflow: auto; padding: 6px 0; }
+  .log-row {
+    display: flex; gap: 10px; align-items: baseline;
+    padding: 2px 12px;
+    border-left: 2px solid transparent;
+    animation: slideLeft 0.3s ease both;
+    font-size: 12px;
+  }
+  .log-row:first-child { border-left-color: var(--green); }
+  .log-v { color: var(--amber); min-width: 5ch; }
+  .log-p { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-p.meta { color: var(--dim); font-style: italic; }
+  .log-t { color: var(--faint); font-size: 10px; }
+  .log-empty { color: var(--faint); padding: 14px 12px; font-style: italic; }
+
+  /* ---------------------------------------------------- toast */
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(80px);
+    padding: 8px 18px;
+    border: 1px solid var(--line-bright); border-radius: 3px;
+    background: var(--panel);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    transition: transform 0.25s ease; z-index: 10;
+    max-width: 80vw;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+  .toast.err { color: var(--red); border-color: var(--red); }
+  .toast.ok { color: var(--green); border-color: var(--green); }
+
+  @keyframes blink { 50% { opacity: 0; } }
+  @keyframes breathe { 50% { box-shadow: 0 0 4px var(--green-glow); } }
+  @keyframes pop { 30% { transform: scale(1.25); color: var(--green); } }
+  @keyframes flashRow {
+    0% { background: rgba(255, 180, 84, 0.28); }
+    100% { background: transparent; }
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+  }
+  @keyframes dropIn {
+    from { opacity: 0; transform: translateY(-8px); }
+  }
+  @keyframes slideLeft {
+    from { opacity: 0; transform: translateX(8px); }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="wordmark">json<span class="dim-mark">·</span>doc<span class="dim-mark">·</span>store</div>
+    <nav class="crumbs" id="crumbs"></nav>
+    <div class="status">
+      <span class="led" id="led"></span>
+      <span class="label" id="conn">offline</span>
+      <span class="label">v</span><span class="ver" id="ver">–</span>
+    </div>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="panel-head">
+        <span>document</span>
+        <span class="spacer"></span>
+        <button id="editBtn">edit</button>
+        <button id="deleteBtn" class="danger">delete</button>
+      </div>
+      <div class="view" id="view"></div>
+      <div class="editor" id="editor">
+        <textarea id="editArea" spellcheck="false"></textarea>
+        <div class="stale-note" id="staleNote"></div>
+        <div class="panel-head" style="border-top:1px solid var(--line);border-bottom:none">
+          <span id="editHint">editing raw (formulas preserved)</span>
+          <span class="spacer"></span>
+          <button id="saveBtn">save</button>
+          <button id="cancelBtn">cancel</button>
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><span>change events</span></div>
+      <div class="log" id="log"><div class="log-empty">awaiting events…</div></div>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+
+// ------------------------------------------------ pointer helpers
+// The page is served at /doc or /doc/<segments>; derive the JSON pointer.
+function pointerFromLocation() {
+  let p = location.pathname;
+  if (p.startsWith("/doc")) p = p.slice(4);
+  if (p === "" || p === "/") return "";
+  return p.split("/").map(decodeURIComponent).join("/");
+}
+function tokens(pointer) {
+  if (pointer === "") return [];
+  return pointer.slice(1).split("/").map((t) => t.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+function escapeToken(t) {
+  return String(t).replace(/~/g, "~0").replace(/\//g, "~1");
+}
+function docHref(toks) {
+  return "/doc" + toks.map((t) => "/" + encodeURIComponent(escapeToken(t))).join("");
+}
+function docUrl(pointer) {
+  return docHref(tokens(pointer));
+}
+
+const state = {
+  pointer: pointerFromLocation(),
+  value: undefined,
+  version: null,
+  editing: false,
+  inlineEditing: false,
+  pendingChanged: null,
+  logCount: 0,
+  reconnectDelay: 400,
+};
+document.title = (state.pointer || "/") + " · jsondocstore";
+
+// ------------------------------------------------ breadcrumbs
+function renderCrumbs() {
+  const el = $("#crumbs");
+  el.innerHTML = "";
+  const toks = tokens(state.pointer);
+  const rootLink = document.createElement("a");
+  rootLink.href = "/doc";
+  rootLink.textContent = "⌂";
+  el.appendChild(rootLink);
+  toks.forEach((t, i) => {
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "/";
+    el.appendChild(sep);
+    const a = document.createElement("a");
+    a.href = docHref(toks.slice(0, i + 1));
+    a.textContent = t;
+    el.appendChild(a);
+  });
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  el.appendChild(cursor);
+}
+renderCrumbs();
+
+// ------------------------------------------------ tree rendering
+// Emits one .row element per JSON line, tagged with its relative pointer so
+// change events can flash exactly the rows they touched.
+function render(changedRel) {
+  if (state.inlineEditing) { state.pendingChanged = changedRel || null; return; }
+  const view = $("#view");
+  view.innerHTML = "";
+  if (state.value === null || state.value === undefined) {
+    const d = document.createElement("div");
+    d.className = "empty-doc";
+    d.textContent = "∅ nothing here yet — hit edit to create it";
+    view.appendChild(d);
+    return;
+  }
+  const rows = [];
+  emit(rows, state.value, "", 0, null, false);
+  for (const r of rows) view.appendChild(r);
+  if (changedRel && changedRel.length) flashRows(changedRel);
+}
+
+function mkRow(depth, relPath) {
+  const r = document.createElement("div");
+  r.className = "row";
+  r.style.setProperty("--d", depth);
+  if (relPath !== null) r.dataset.path = relPath;
+  return r;
+}
+function keyEl(key, relPath) {
+  const a = document.createElement("a");
+  a.className = "k";
+  a.href = docHref(tokens(state.pointer + relPath));
+  a.textContent = JSON.stringify(key);
+  a.title = "open " + (state.pointer + relPath);
+  return a;
+}
+function punct(t) {
+  const s = document.createElement("span");
+  s.className = "p";
+  s.textContent = t;
+  return s;
+}
+function scalarEl(v, relPath) {
+  const s = document.createElement("span");
+  let text = JSON.stringify(v);
+  if (typeof v === "string") {
+    s.className = v.startsWith("#ERR") ? "v-err" : "v-str";
+  } else if (typeof v === "number") s.className = "v-num";
+  else if (typeof v === "boolean") s.className = "v-bool";
+  else s.className = "v-null";
+  s.textContent = text;
+  s.classList.add("editable");
+  s.title = "click to edit";
+  s.addEventListener("click", () => inlineEdit(s, v, relPath));
+  return s;
+}
+
+function emit(rows, v, relPath, depth, key, trailingComma) {
+  const isObj = v !== null && typeof v === "object" && !Array.isArray(v);
+  const isArr = Array.isArray(v);
+  const open = isArr ? "[" : "{";
+  const close = isArr ? "]" : "}";
+  if (!isObj && !isArr) {
+    const r = mkRow(depth, relPath);
+    if (key !== null) { r.appendChild(keyEl(key, relPath)); r.appendChild(punct(": ")); }
+    r.appendChild(scalarEl(v, relPath));
+    if (trailingComma) r.appendChild(punct(","));
+    rows.push(r);
+    return;
+  }
+  const entries = isArr ? v.map((x, i) => [i, x]) : Object.entries(v);
+  const head = mkRow(depth, relPath);
+  if (key !== null) { head.appendChild(keyEl(key, relPath)); head.appendChild(punct(": ")); }
+  head.appendChild(punct(entries.length ? open : open + close + (trailingComma ? "," : "")));
+  rows.push(head);
+  if (!entries.length) return;
+  entries.forEach(([k, child], idx) => {
+    const childRel = relPath + "/" + escapeToken(k);
+    emit(rows, child, childRel, depth + 1, isArr ? null : String(k), idx < entries.length - 1);
+  });
+  // array items get an index affordance via flash/data-path only; arrays show
+  // bare values (JSON-style), objects show quoted keys.
+  const tail = mkRow(depth, null);
+  tail.appendChild(punct(close + (trailingComma ? "," : "")));
+  rows.push(tail);
+}
+
+function flashRows(changedRel) {
+  const rows = document.querySelectorAll(".row[data-path]");
+  for (const row of rows) {
+    const p = row.dataset.path;
+    for (const c of changedRel) {
+      if (c === p || c.startsWith(p + "/") || p.startsWith(c + "/") || c === "" || p === "") {
+        row.classList.add("flash");
+        row.addEventListener("animationend", () => row.classList.remove("flash"), { once: true });
+        break;
+      }
+    }
+  }
+}
+
+// ------------------------------------------------ inline scalar editing
+function inlineEdit(span, current, relPath) {
+  if (state.editing || state.inlineEditing) return;
+  state.inlineEditing = true;
+  const input = document.createElement("input");
+  input.className = "inline-input";
+  input.value = JSON.stringify(current);
+  input.size = Math.max(input.value.length + 2, 8);
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+  const finish = (commit) => {
+    if (!state.inlineEditing) return;
+    state.inlineEditing = false;
+    if (commit) {
+      let parsed;
+      const raw = input.value.trim();
+      try { parsed = JSON.parse(raw); } catch { parsed = raw; } // bare words → string
+      putValue(state.pointer + relPath, parsed);
+    }
+    render(state.pendingChanged);
+    state.pendingChanged = null;
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(false));
+}
+
+async function putValue(pointer, value) {
+  try {
+    const resp = await fetch(docUrl(pointer), {
+      method: "PUT",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(value),
+    });
+    const body = await resp.json();
+    if (!resp.ok) toast(body.error || ("HTTP " + resp.status), true);
+    else toast("committed v" + body.version, false);
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+// ------------------------------------------------ whole-document editor
+$("#editBtn").addEventListener("click", async () => {
+  if (state.editing) return;
+  state.editing = true;
+  $("#staleNote").classList.remove("show");
+  let text = "{}";
+  try {
+    // Edit the RAW form so formulas ($formula/$value) round-trip intact.
+    const resp = await fetch(docUrl(state.pointer) + "?raw=true", {
+      headers: { accept: "application/json" },
+    });
+    if (resp.ok) text = JSON.stringify(await resp.json(), null, 2);
+  } catch { /* fall through to empty object */ }
+  $("#editArea").value = text;
+  $("#view").classList.add("hidden");
+  $("#editor").classList.add("active");
+  $("#editArea").focus();
+});
+function closeEditor() {
+  state.editing = false;
+  $("#editor").classList.remove("active");
+  $("#view").classList.remove("hidden");
+  render();
+}
+$("#cancelBtn").addEventListener("click", closeEditor);
+$("#saveBtn").addEventListener("click", async () => {
+  let value;
+  try {
+    value = JSON.parse($("#editArea").value);
+  } catch (e) {
+    toast("invalid JSON: " + e.message, true);
+    return;
+  }
+  await putValue(state.pointer, value);
+  closeEditor();
+});
+$("#deleteBtn").addEventListener("click", async () => {
+  const label = state.pointer || "/ (entire document)";
+  if (!confirm("Delete " + label + " ?")) return;
+  try {
+    const resp = await fetch(docUrl(state.pointer), {
+      method: "DELETE",
+      headers: { accept: "application/json" },
+    });
+    const body = await resp.json();
+    if (!resp.ok) toast(body.error || ("HTTP " + resp.status), true);
+    else toast("deleted · v" + body.version, false);
+  } catch (e) {
+    toast(String(e), true);
+  }
+});
+
+// ------------------------------------------------ event log
+function logEvent(version, paths, meta) {
+  const log = $("#log");
+  if (state.logCount === 0) log.innerHTML = "";
+  state.logCount++;
+  const row = document.createElement("div");
+  row.className = "log-row";
+  const t = new Date();
+  const hh = (n) => String(n).padStart(2, "0");
+  row.innerHTML = "";
+  const v = document.createElement("span");
+  v.className = "log-v";
+  v.textContent = "v" + version;
+  const p = document.createElement("span");
+  p.className = "log-p" + (meta ? " meta" : "");
+  p.textContent = paths;
+  p.title = paths;
+  const ts = document.createElement("span");
+  ts.className = "log-t";
+  ts.textContent = hh(t.getHours()) + ":" + hh(t.getMinutes()) + ":" + hh(t.getSeconds());
+  row.append(v, p, ts);
+  log.prepend(row);
+  while (log.children.length > 80) log.lastChild.remove();
+}
+
+// ------------------------------------------------ status + toast
+function setConnected(on) {
+  $("#led").classList.toggle("on", on);
+  $("#conn").textContent = on ? "live" : "offline";
+}
+function setVersion(v) {
+  state.version = v;
+  const el = $("#ver");
+  el.textContent = String(v);
+  el.classList.remove("tick");
+  void el.offsetWidth; // restart animation
+  el.classList.add("tick");
+}
+let toastTimer = null;
+function toast(msg, isErr) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.className = "toast show " + (isErr ? "err" : "ok");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+// ------------------------------------------------ websocket
+function relativeChanged(paths) {
+  // Map absolute changed paths to paths relative to our subscription root.
+  const out = [];
+  for (const c of paths) {
+    if (state.pointer === "") out.push(c);
+    else if (c === state.pointer) out.push("");
+    else if (c.startsWith(state.pointer + "/")) out.push(c.slice(state.pointer.length));
+    else out.push(""); // ancestor changed: the whole view is affected
+  }
+  return out;
+}
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(proto + "://" + location.host + "/ws?path=" + encodeURIComponent(state.pointer));
+  ws.onopen = () => {
+    setConnected(true);
+    state.reconnectDelay = 400;
+  };
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === "snapshot") {
+      state.value = msg.value;
+      setVersion(msg.version);
+      logEvent(msg.version, msg.resync ? "resync snapshot" : "initial snapshot", true);
+      if (!state.editing) render();
+    } else if (msg.type === "change") {
+      state.value = msg.value;
+      setVersion(msg.version);
+      logEvent(msg.version, msg.changed_paths.join("  "));
+      if (state.editing) {
+        const note = $("#staleNote");
+        note.textContent = "⚠ v" + msg.version + " arrived while editing — saving will overwrite it";
+        note.classList.add("show");
+      } else {
+        render(relativeChanged(msg.changed_paths));
+      }
+    }
+  };
+  ws.onclose = () => {
+    setConnected(false);
+    setTimeout(connect, state.reconnectDelay);
+    state.reconnectDelay = Math.min(state.reconnectDelay * 2, 8000);
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script>
+</body>
+</html>

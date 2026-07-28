@@ -11,11 +11,12 @@
 //!   GET    /ws?path=/a/b            subscribe: snapshot, then ordered changes
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -92,19 +93,47 @@ struct GetQuery {
 
 // ------------------------------------------------------------------ GET
 
-async fn get_root(State(store): State<Arc<Store>>, Query(q): Query<GetQuery>) -> ApiResult {
-    read(store, String::new(), q).await
+/// The embedded live UI, compiled into the binary.
+const UI_HTML: &str = include_str!("ui.html");
+
+/// Browsers announce `text/html` ahead of anything else in Accept; API
+/// clients (curl's `*/*`, fetch with `application/json`) do not.
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|accept| match (accept.find("text/html"), accept.find("application/json")) {
+            (Some(h), Some(j)) => h < j,
+            (Some(_), None) => true,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+async fn get_root(
+    State(store): State<Arc<Store>>,
+    Query(q): Query<GetQuery>,
+    headers: HeaderMap,
+) -> ApiResult {
+    read(store, String::new(), q, headers).await
 }
 
 async fn get_path(
     State(store): State<Arc<Store>>,
     Path(path): Path<String>,
     Query(q): Query<GetQuery>,
+    headers: HeaderMap,
 ) -> ApiResult {
-    read(store, pointer_of(&path), q).await
+    read(store, pointer_of(&path), q, headers).await
 }
 
-async fn read(store: Arc<Store>, ptr: String, q: GetQuery) -> ApiResult {
+async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -> ApiResult {
+    // Browsers get the live UI for any path — even one that doesn't exist
+    // yet, so you can navigate somewhere and create it. `?raw=true` stays
+    // JSON as an escape hatch for looking at formulas from the address bar.
+    if !q.raw && wants_html(&headers) {
+        return Ok(Html(UI_HTML).into_response());
+    }
     let value = if q.raw {
         store.get_raw(&ptr)?
     } else {
@@ -232,6 +261,60 @@ async fn txn_handler(State(store): State<Arc<Store>>, Json(req): Json<TxnRequest
 
 async fn version_handler(State(store): State<Arc<Store>>) -> ApiResult {
     Ok(Json(json!({ "version": store.version() })).into_response())
+}
+
+// ------------------------------------------------------------------ /info ticker
+
+/// Spawn the liveness ticker: writes wall-clock time and uptime to `/info`
+/// every `period`. Doubles as a heartbeat for subscribers watching the root.
+pub fn spawn_info_ticker(store: Arc<Store>, period: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started = SystemTime::now();
+        let started_iso = rfc3339(started);
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let now = SystemTime::now();
+            let epoch_ms = now
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let uptime = now.duration_since(started).unwrap_or_default().as_secs();
+            let info = json!({
+                "time": rfc3339(now),
+                "epoch_ms": epoch_ms,
+                "uptime_secs": uptime,
+                "started": started_iso,
+            });
+            if let Err(e) = store.put("/info", info) {
+                tracing::warn!(error = %e, "info ticker write failed");
+            }
+        }
+    })
+}
+
+/// UTC RFC 3339 timestamp without pulling in a date crate
+/// (civil-from-days per Howard Hinnant's algorithm).
+fn rfc3339(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 // ------------------------------------------------------------------ /ws

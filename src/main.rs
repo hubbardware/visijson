@@ -45,6 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Liveness heartbeat at /info, once per second by default (0 disables).
+    let info_tick_secs: u64 = std::env::var("INFO_TICK_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    if info_tick_secs > 0 {
+        api::spawn_info_ticker(store.clone(), Duration::from_secs(info_tick_secs));
+    }
+
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "listening");

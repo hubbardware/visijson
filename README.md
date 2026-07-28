@@ -31,10 +31,29 @@ Features:
 |---|---|
 | `model` | Immutable `Node` tree, `Pointer`, path-copy `get/set/insert/remove` |
 | `store` | `ArcSwap` root, CAS commits, ops, conditions, optimistic transactions |
-| `api` | axum REST + WebSocket handlers |
+| `api` | axum REST + WebSocket handlers, embedded UI, `/info` ticker |
 | `subscriptions` | Ordered event publication (`Hub`), path relevance |
 | `formulas` | Expression parser/evaluator, dependency graph, topo re-eval |
 | `persistence` | WAL append/replay, snapshot write/rotate, recovery |
+
+## Live web UI
+
+Open any document path in a browser — `http://localhost:8080/doc` or
+`/doc/any/sub/path` — and the server content-negotiates an embedded
+single-file UI (API clients still get JSON; `?raw=true` forces JSON from the
+address bar). The page subscribes to that subtree over the WebSocket and:
+
+- renders the value as a navigable JSON tree (keys link deeper, breadcrumbs
+  link up), live-updating with per-row flashes on every relevant commit
+- lets you click any scalar to edit it in place (PUT to that pointer), or
+  edit the whole subtree as raw JSON — formulas round-trip intact
+- shows connection status, current version, and a change-event log
+- reconnects automatically with backoff, resyncing via a fresh snapshot
+
+The server also maintains a liveness node at `/info` — wall-clock time
+(RFC 3339), epoch millis, uptime, and start time — rewritten once per second
+(`INFO_TICK_SECS`, `0` disables). Watching `/doc` in a browser therefore
+shows a heartbeat; `GET /doc/info/time` works as a liveness probe.
 
 ## Running
 

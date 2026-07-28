@@ -197,6 +197,84 @@ async fn formulas_over_rest() {
 }
 
 #[tokio::test]
+async fn browsers_get_the_embedded_ui_api_clients_get_json() {
+    let (base, store) = serve().await;
+    store.put("/a", json!(1)).unwrap();
+    let client = reqwest::Client::new();
+
+    // Browser-style Accept → HTML app, even for paths that don't exist yet.
+    for path in ["/doc", "/doc/a", "/doc/not/yet/created"] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "GET {path}");
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "GET {path} → {ct}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("jsondocstore"), "UI page not served for {path}");
+    }
+
+    // JSON Accept (and curl's */*) still get data + real 404s.
+    let v: Value = client
+        .get(format!("{base}/doc/a"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, json!(1));
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("accept", "*/*")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!(1));
+
+    // ?raw=true from a browser stays JSON (address-bar escape hatch).
+    let resp = client
+        .get(format!("{base}/doc/a?raw=true"))
+        .header("accept", "text/html,*/*;q=0.8")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("application/json"));
+}
+
+#[tokio::test]
+async fn info_ticker_heartbeats() {
+    let (_base, store) = serve().await;
+    jsondocstore::api::spawn_info_ticker(store.clone(), std::time::Duration::from_millis(20));
+
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let info = store.get("/info").unwrap().expect("/info should exist");
+    let time = info["time"].as_str().unwrap();
+    // RFC 3339 shape: 2026-07-28T12:34:56Z
+    assert_eq!(time.len(), 20, "unexpected time format: {time}");
+    assert!(time.ends_with('Z') && time.contains('T'));
+    assert!(time.starts_with("20"), "implausible year in {time}");
+    assert!(info["epoch_ms"].as_u64().unwrap() > 1_700_000_000_000);
+    assert!(info["uptime_secs"].is_u64());
+    assert_eq!(info["started"].as_str().unwrap().len(), 20);
+
+    // It keeps ticking: version advances and subscribers see /info changes.
+    let v1 = store.version();
+    let (_, mut rx) = store.subscribe();
+    let ev = rx.recv().await.unwrap();
+    assert!(ev.changed_paths.iter().any(|p| p == "/info"));
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(store.version() > v1, "ticker stopped advancing versions");
+}
+
+#[tokio::test]
 async fn websocket_snapshot_then_ordered_filtered_changes() {
     let (base, store) = serve().await;
     let ws_url = format!("{}/ws?path=/watched", base.replace("http", "ws"));
