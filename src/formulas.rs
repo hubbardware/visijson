@@ -406,7 +406,10 @@ pub fn reevaluate(
     let mut rev: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in 0..n {
-            if i != j && entries[i].deps.iter().any(|d| d.overlaps(&entries[j].path)) {
+            if entries[i].deps.iter().any(|d| d.overlaps(&entries[j].path)) {
+                if i == j {
+                    return Err(StoreError::FormulaCycle(entries[i].path.to_string()));
+                }
                 edges[i].push(j);
                 rev[j].push(i);
             }

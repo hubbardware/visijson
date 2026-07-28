@@ -309,6 +309,14 @@ impl Store {
                 Ok(info) => return Ok((out, info, attempt)),
                 Err(StoreError::Conflict(reason)) => {
                     tracing::debug!(attempt, %reason, "transaction conflict, retrying");
+                    // Back off so hot-key contention can't starve one writer
+                    // through the whole retry budget.
+                    if attempt >= 2 {
+                        let micros = 10u64 << attempt.min(8); // 40µs .. 2.5ms
+                        std::thread::sleep(std::time::Duration::from_micros(micros));
+                    } else {
+                        std::thread::yield_now();
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),

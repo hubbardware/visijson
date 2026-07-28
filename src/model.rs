@@ -194,12 +194,8 @@ fn parse_index(tok: &str, ptr: &Pointer) -> Result<usize> {
 pub fn get_at(root: &Arc<Node>, ptr: &Pointer) -> Option<Arc<Node>> {
     let mut cur = root.clone();
     for tok in ptr.tokens() {
-        loop {
-            let next = if let Node::Formula(f) = &*cur {
-                f.cached.clone()
-            } else {
-                break;
-            };
+        while let Node::Formula(f) = &*cur {
+            let next = f.cached.clone();
             cur = next;
         }
         let next = match &*cur {
