@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use crate::error::StoreError;
 use crate::model::{get_at, to_plain_value, Pointer};
 use crate::store::{Condition, Op, Store};
-use crate::subscriptions::is_relevant;
 
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
@@ -358,19 +357,32 @@ async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer) {
         tokio::select! {
             event = rx.recv() => match event {
                 Ok(ev) => {
-                    let relevant: Vec<&String> = ev
-                        .changed_paths
-                        .iter()
-                        .filter(|c| is_relevant(&ptr, c))
-                        .collect();
-                    if relevant.is_empty() {
+                    // Deltas only: for each relevant changed path, ship the
+                    // new value at that path (clamped to the subscription
+                    // root when an ancestor changed). Untouched siblings are
+                    // never re-sent; the snapshot established base state.
+                    let mut targets = std::collections::BTreeSet::new();
+                    for c in ev.changed_paths.iter() {
+                        let Ok(c) = Pointer::parse(c) else { continue };
+                        if !ptr.overlaps(&c) {
+                            continue;
+                        }
+                        targets.insert(if ptr.is_prefix_of(&c) { c } else { ptr.clone() });
+                    }
+                    if targets.is_empty() {
                         continue;
                     }
+                    let changes: Vec<Value> = targets
+                        .iter()
+                        .map(|t| match get_at(&ev.committed.root, t) {
+                            Some(n) => json!({"path": t.to_string(), "value": to_plain_value(&n)}),
+                            None => json!({"path": t.to_string(), "removed": true}),
+                        })
+                        .collect();
                     let msg = json!({
                         "type": "change",
                         "version": ev.version,
-                        "changed_paths": relevant,
-                        "value": value_at(&ev.committed.root, &ptr),
+                        "changes": changes,
                     });
                     if socket.send(Message::Text(msg.to_string())).await.is_err() {
                         return;

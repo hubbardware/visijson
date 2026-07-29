@@ -87,6 +87,10 @@ pub struct Store {
     max_retries: u32,
 }
 
+/// A `Put` diff reporting more distinct paths than this collapses to the
+/// put's own path — keeps changed-path lists bounded for huge replacements.
+const MAX_DIFF_PATHS: usize = 64;
+
 /// Apply ops in order against `root`, returning the new root and the set of
 /// changed paths. Pure — shared by live commits and WAL replay.
 pub fn apply_ops(root: &Arc<Node>, ops: &[Op]) -> Result<(Arc<Node>, BTreeSet<Pointer>)> {
@@ -96,18 +100,41 @@ pub fn apply_ops(root: &Arc<Node>, ops: &[Op]) -> Result<(Arc<Node>, BTreeSet<Po
         match op {
             Op::Put { path, value } => {
                 let p = Pointer::parse(path)?;
-                r = set_at(&r, &p, from_value(value))?;
-                changed.insert(p);
+                let new = from_value(value);
+                let old = get_at(&r, &p);
+                r = set_at(&r, &p, new.clone())?;
+                match old {
+                    // Replacing an existing subtree: record only what
+                    // actually differs, so rewriting a mostly-identical
+                    // object doesn't flag untouched fields as changed.
+                    Some(old) => {
+                        let mut diff = Vec::new();
+                        model::diff_paths(&old, &new, &p, &mut diff);
+                        if diff.len() > MAX_DIFF_PATHS {
+                            changed.insert(p);
+                        } else {
+                            changed.extend(diff);
+                        }
+                    }
+                    None => {
+                        changed.insert(p);
+                    }
+                }
             }
             Op::Insert { path, value } => {
                 let p = Pointer::parse(path)?;
+                let array_parent = parent_array(&r, &p);
                 r = insert_at(&r, &p, from_value(value))?;
-                changed.insert(p);
+                // Inserting into an array shifts every later sibling, so the
+                // whole array changed — not just the inserted index.
+                changed.insert(array_parent.unwrap_or(p));
             }
             Op::Remove { path } => {
                 let p = Pointer::parse(path)?;
+                let array_parent = parent_array(&r, &p);
                 r = remove_at(&r, &p)?;
-                changed.insert(p);
+                // Same shift logic as Insert for array element removal.
+                changed.insert(array_parent.unwrap_or(p));
             }
             Op::Append { path, value } => {
                 let p = Pointer::parse(path)?;
@@ -134,6 +161,12 @@ pub fn apply_ops(root: &Arc<Node>, ops: &[Op]) -> Result<(Arc<Node>, BTreeSet<Po
         }
     }
     Ok((r, changed))
+}
+
+/// If `p` addresses an element of an array, return the array's path.
+fn parent_array(root: &Arc<Node>, p: &Pointer) -> Option<Pointer> {
+    let parent = p.parent()?;
+    matches!(get_at(root, &parent).as_deref(), Some(Node::Array(_))).then_some(parent)
 }
 
 fn check_conditions(root: &Arc<Node>, conditions: &[Condition]) -> Result<()> {

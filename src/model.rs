@@ -339,6 +339,47 @@ fn remove_rec(node: &Arc<Node>, toks: &[String], full: &Pointer) -> Result<Arc<N
     }
 }
 
+/// Structural diff: record the paths where `new` actually differs from
+/// `old`. Shared subtrees (`Arc::ptr_eq`) and equal scalars contribute
+/// nothing, so replacing a subtree with a mostly-identical value reports
+/// only the fields that really changed. Containers of different shape
+/// (object vs scalar, arrays of different length) report their own path.
+pub fn diff_paths(old: &Arc<Node>, new: &Arc<Node>, base: &Pointer, out: &mut Vec<Pointer>) {
+    if Arc::ptr_eq(old, new) {
+        return;
+    }
+    match (&**old, &**new) {
+        (Node::Null, Node::Null) => {}
+        (Node::Bool(a), Node::Bool(b)) if a == b => {}
+        (Node::Number(a), Node::Number(b)) if a == b => {}
+        (Node::String(a), Node::String(b)) if a == b => {}
+        (Node::Object(a), Node::Object(b)) => {
+            for (k, vb) in b {
+                match a.get(k) {
+                    Some(va) => diff_paths(va, vb, &base.push(k.clone()), out),
+                    None => out.push(base.push(k.clone())),
+                }
+            }
+            for k in a.keys() {
+                if !b.contains_key(k) {
+                    out.push(base.push(k.clone()));
+                }
+            }
+        }
+        (Node::Array(a), Node::Array(b)) if a.len() == b.len() => {
+            for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+                diff_paths(va, vb, &base.push(i.to_string()), out);
+            }
+        }
+        (Node::Formula(a), Node::Formula(b)) => {
+            if a.expr != b.expr || !nodes_equal(&a.cached, &b.cached) {
+                out.push(base.clone());
+            }
+        }
+        _ => out.push(base.clone()),
+    }
+}
+
 /// Visit every node in the tree (skipping formula cached values, which are
 /// derived data) with its pointer path.
 pub fn walk(root: &Arc<Node>, mut visit: impl FnMut(&Pointer, &Arc<Node>)) {

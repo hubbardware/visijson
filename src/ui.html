@@ -580,16 +580,40 @@ function toast(msg, isErr) {
 }
 
 // ------------------------------------------------ websocket
-function relativeChanged(paths) {
-  // Map absolute changed paths to paths relative to our subscription root.
-  const out = [];
-  for (const c of paths) {
-    if (state.pointer === "") out.push(c);
-    else if (c === state.pointer) out.push("");
-    else if (c.startsWith(state.pointer + "/")) out.push(c.slice(state.pointer.length));
-    else out.push(""); // ancestor changed: the whole view is affected
+function relativePath(abs) {
+  // Server clamps change paths to our subtree, so abs is us or below us.
+  if (abs === state.pointer) return "";
+  return abs.slice(state.pointer.length);
+}
+
+// Change events are deltas: apply each {path, value|removed} entry to the
+// local copy established by the snapshot.
+function applyChanges(changes) {
+  for (const ch of changes) {
+    const toks = tokens(relativePath(ch.path));
+    if (toks.length === 0) {
+      state.value = ch.removed ? null : ch.value;
+      continue;
+    }
+    if (state.value === null || typeof state.value !== "object") state.value = {};
+    let cur = state.value;
+    for (let i = 0; i < toks.length - 1; i++) {
+      const t = toks[i];
+      if (cur[t] === null || typeof cur[t] !== "object") {
+        cur[t] = /^\d+$/.test(toks[i + 1]) ? [] : {};
+      }
+      cur = cur[t];
+    }
+    const last = toks[toks.length - 1];
+    if (ch.removed) {
+      if (Array.isArray(cur)) cur.splice(Number(last), 1);
+      else delete cur[last];
+    } else if (Array.isArray(cur)) {
+      cur[Number(last)] = ch.value;
+    } else {
+      cur[last] = ch.value;
+    }
   }
-  return out;
 }
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -607,15 +631,15 @@ function connect() {
       logEvent(msg.version, msg.resync ? "resync snapshot" : "initial snapshot", true);
       if (!state.editing) render();
     } else if (msg.type === "change") {
-      state.value = msg.value;
+      applyChanges(msg.changes);
       setVersion(msg.version);
-      logEvent(msg.version, msg.changed_paths.join("  "));
+      logEvent(msg.version, msg.changes.map((c) => c.path + (c.removed ? " ✕" : "")).join("  "));
       if (state.editing) {
         const note = $("#staleNote");
         note.textContent = "⚠ v" + msg.version + " arrived while editing — saving will overwrite it";
         note.classList.add("show");
       } else {
-        render(relativeChanged(msg.changed_paths));
+        render(msg.changes.map((c) => relativePath(c.path)));
       }
     }
   };

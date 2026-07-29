@@ -269,7 +269,23 @@ async fn info_ticker_heartbeats() {
     let v1 = store.version();
     let (_, mut rx) = store.subscribe();
     let ev = rx.recv().await.unwrap();
-    assert!(ev.changed_paths.iter().any(|p| p == "/info"));
+    assert!(
+        ev.changed_paths.iter().any(|p| p.starts_with("/info")),
+        "got {:?}",
+        ev.changed_paths
+    );
+    // Only the fields that actually change are reported — `started` is
+    // constant after the first tick and must never be flagged.
+    assert!(
+        ev.changed_paths.iter().any(|p| p == "/info/time" || p == "/info/epoch_ms"),
+        "got {:?}",
+        ev.changed_paths
+    );
+    assert!(
+        !ev.changed_paths.iter().any(|p| p == "/info/started" || p == "/info"),
+        "unchanged fields flagged: {:?}",
+        ev.changed_paths
+    );
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     assert!(store.version() > v1, "ticker stopped advancing versions");
 }
@@ -307,7 +323,6 @@ async fn websocket_snapshot_then_ordered_filtered_changes() {
             m => panic!("expected text, got {m:?}"),
         };
         assert_eq!(msg["type"], "change");
-        assert_eq!(msg["changed_paths"], json!(["/watched/n"]));
         seen.push(msg);
     }
 
@@ -316,8 +331,15 @@ async fn websocket_snapshot_then_ordered_filtered_changes() {
     let v2 = seen[1]["version"].as_u64().unwrap();
     assert!(v1 > snap_version);
     assert!(v2 > v1);
-    assert_eq!(seen[0]["value"], json!({"n": 1}));
-    assert_eq!(seen[1]["value"], json!({"n": 2}));
+    // Deltas carry only the changed path's new value — never siblings.
+    assert_eq!(
+        seen[0]["changes"],
+        json!([{"path": "/watched/n", "value": 1}])
+    );
+    assert_eq!(
+        seen[1]["changes"],
+        json!([{"path": "/watched/n", "value": 2}])
+    );
 
     ws.send(Message::Close(None)).await.unwrap();
 }
@@ -353,9 +375,7 @@ async fn websocket_subscribers_watching_different_paths() {
         serde_json::from_str::<Value>(msg.to_text().unwrap()).unwrap()
     }
     let a_msg = next(&mut ws_a).await;
-    assert_eq!(a_msg["changed_paths"], json!(["/a"]));
-    assert_eq!(a_msg["value"], json!(1));
+    assert_eq!(a_msg["changes"], json!([{"path": "/a", "value": 1}]));
     let b_msg = next(&mut ws_b).await;
-    assert_eq!(b_msg["changed_paths"], json!(["/b"]));
-    assert_eq!(b_msg["value"], json!(2));
+    assert_eq!(b_msg["changes"], json!([{"path": "/b", "value": 2}]));
 }

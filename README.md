@@ -16,8 +16,9 @@ Features:
   (Rust closure API) and conditional commits (`test` ops / `conditions`) over
   REST
 - **WebSocket subscriptions by path** — consistent initial snapshot followed
-  by gap-free, strictly version-ordered change events, filtered by path
-  relevance; every commit records its changed paths
+  by gap-free, strictly version-ordered **delta** events (only the changed
+  paths and their new values, never untouched siblings), filtered by path
+  relevance; every commit records its precisely-diffed changed paths
 - **Formula nodes** — spreadsheet-style expressions over pointer references
   with dependency tracking, topological re-evaluation, and cycle detection
   (cycles reject the commit)
@@ -90,10 +91,11 @@ curl -X PUT localhost:8080/doc/total -d '{"$formula": "sum(/cart/prices) * 1.08"
 curl localhost:8080/doc/total                      # computed number
 curl 'localhost:8080/doc/total?raw=true'           # {"$formula": ..., "$value": ...}
 
-# Subscribe (snapshot first, then ordered change events)
+# Subscribe (snapshot first, then ordered delta events)
 websocat 'ws://localhost:8080/ws?path=/users/alice'
 # → {"type":"snapshot","version":3,"path":"/users/alice","value":{...}}
-# → {"type":"change","version":4,"changed_paths":["/users/alice/age"],"value":{...}}
+# → {"type":"change","version":4,"changes":[{"path":"/users/alice/age","value":31}]}
+# → {"type":"change","version":5,"changes":[{"path":"/users/alice/nick","removed":true}]}
 ```
 
 Formula grammar: `+ - * /`, parentheses, unary minus, numeric literals,

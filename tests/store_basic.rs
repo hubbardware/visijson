@@ -42,6 +42,86 @@ fn changed_paths_recorded() {
 }
 
 #[test]
+fn put_records_only_genuinely_changed_paths() {
+    let store = Store::in_memory();
+    store
+        .put("/info", json!({"time": "t1", "uptime": 1, "started": "t0"}))
+        .unwrap();
+
+    // Rewrite the whole object with one field identical: `started` must NOT
+    // be reported as changed.
+    let info = store
+        .put("/info", json!({"time": "t2", "uptime": 2, "started": "t0"}))
+        .unwrap();
+    assert_eq!(info.changed_paths, vec!["/info/time", "/info/uptime"]);
+
+    // Fully identical rewrite → nothing changed (version still advances).
+    let info = store
+        .put("/info", json!({"time": "t2", "uptime": 2, "started": "t0"}))
+        .unwrap();
+    assert!(info.changed_paths.is_empty(), "got {:?}", info.changed_paths);
+    assert_eq!(info.version, 3);
+
+    // Added and removed keys are each reported.
+    let info = store
+        .put("/info", json!({"time": "t2", "uptime": 2, "extra": true}))
+        .unwrap();
+    assert_eq!(info.changed_paths, vec!["/info/extra", "/info/started"]);
+
+    // Same-length arrays diff per index; changed shape reports the array.
+    store.put("/arr", json!([1, 2, 3])).unwrap();
+    let info = store.put("/arr", json!([1, 9, 3])).unwrap();
+    assert_eq!(info.changed_paths, vec!["/arr/1"]);
+    let info = store.put("/arr", json!([1, 9])).unwrap();
+    assert_eq!(info.changed_paths, vec!["/arr"]);
+
+    // Type change reports the path itself.
+    let info = store.put("/arr", json!("now a string")).unwrap();
+    assert_eq!(info.changed_paths, vec!["/arr"]);
+}
+
+#[test]
+fn array_insert_and_remove_report_the_whole_array() {
+    use jsondocstore::store::Op;
+    let store = Store::in_memory();
+    store.put("/l", json!([1, 2, 3])).unwrap();
+
+    // Insert shifts later siblings, so the array itself is the changed path.
+    let info = store
+        .commit(
+            vec![Op::Insert {
+                path: "/l/1".into(),
+                value: json!(9),
+            }],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(info.changed_paths, vec!["/l"]);
+    assert_eq!(store.get("/l").unwrap(), Some(json!([1, 9, 2, 3])));
+
+    let info = store.remove("/l/0").unwrap();
+    assert_eq!(info.changed_paths, vec!["/l"]);
+    assert_eq!(store.get("/l").unwrap(), Some(json!([9, 2, 3])));
+
+    // Object key removal stays precise.
+    store.put("/o", json!({"a": 1, "b": 2})).unwrap();
+    let info = store.remove("/o/a").unwrap();
+    assert_eq!(info.changed_paths, vec!["/o/a"]);
+}
+
+#[test]
+fn identical_put_does_not_wake_formulas() {
+    let store = Store::in_memory();
+    store.put("/a", json!(5)).unwrap();
+    store.put("/f", json!({"$formula": "/a * 2"})).unwrap();
+    // Re-putting the same value produces no changed paths, so the dependent
+    // formula must not appear in changed paths either.
+    let info = store.put("/a", json!(5)).unwrap();
+    assert!(info.changed_paths.is_empty(), "got {:?}", info.changed_paths);
+    assert_eq!(store.get("/f").unwrap(), Some(json!(10)));
+}
+
+#[test]
 fn append_creates_array() {
     let store = Store::in_memory();
     store.append("/log", json!("first")).unwrap();
