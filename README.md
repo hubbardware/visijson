@@ -10,15 +10,18 @@ Features:
 
 - **JSON pointer addressing** (RFC 6901, including `~0`/`~1` escapes and `-`
   array append)
-- **REST API** — GET / PUT / POST (append) / PATCH (RFC 6902 subset:
-  `add`/`replace`/`remove`/`test`) / DELETE, plus a `/txn` batch endpoint
+- **REST API** — GET / PUT / POST (append) / DELETE, PATCH speaking both
+  RFC 6902 JSON Patch (`add`/`replace`/`remove`/`test`) and RFC 7396 JSON
+  Merge Patch, plus a `/txn` batch endpoint
 - **Optimistic transactions** — read-set validation with automatic retry
   (Rust closure API) and conditional commits (`test` ops / `conditions`) over
   REST
 - **WebSocket subscriptions by path** — consistent initial snapshot followed
-  by gap-free, strictly version-ordered **delta** events (only the changed
-  paths and their new values, never untouched siblings), filtered by path
-  relevance; every commit records its precisely-diffed changed paths
+  by gap-free, strictly version-ordered **standard patch** events: RFC 6902
+  JSON Patch by default (paths relative to the subscription root, directly
+  applicable with any JSON Patch library), or RFC 7396 JSON Merge Patch with
+  `?format=merge-patch`. Only changed paths are shipped, never untouched
+  siblings; every commit records its precisely-diffed changed paths
 - **Formula nodes** — spreadsheet-style expressions over pointer references
   with dependency tracking, topological re-evaluation, and cycle detection
   (cycles reject the commit)
@@ -74,11 +77,17 @@ curl localhost:8080/doc/users/alice/age            # → 30
 # Append to an array (created on first append)
 curl -X POST localhost:8080/doc/log -d '"started"' -H 'content-type: application/json'
 
-# JSON Patch with a guard
+# RFC 6902 JSON Patch with a guard (array body, or content-type
+# application/json-patch+json)
 curl -X PATCH localhost:8080/doc -H 'content-type: application/json' -d '[
   {"op": "test", "path": "/users/alice/age", "value": 30},
   {"op": "replace", "path": "/users/alice/age", "value": 31}
 ]'
+
+# RFC 7396 JSON Merge Patch (object body, or content-type
+# application/merge-patch+json); null deletes a member
+curl -X PATCH localhost:8080/doc/users -H 'content-type: application/merge-patch+json' \
+  -d '{"alice": {"age": 32}, "bob": null}'
 
 # Conditional transaction (409 on conflict — retry client-side)
 curl -X POST localhost:8080/txn -H 'content-type: application/json' -d '{
@@ -91,11 +100,16 @@ curl -X PUT localhost:8080/doc/total -d '{"$formula": "sum(/cart/prices) * 1.08"
 curl localhost:8080/doc/total                      # computed number
 curl 'localhost:8080/doc/total?raw=true'           # {"$formula": ..., "$value": ...}
 
-# Subscribe (snapshot first, then ordered delta events)
+# Subscribe: snapshot first, then RFC 6902 patches relative to the
+# subscription root — pipe them into any JSON Patch library as-is
 websocat 'ws://localhost:8080/ws?path=/users/alice'
 # → {"type":"snapshot","version":3,"path":"/users/alice","value":{...}}
-# → {"type":"change","version":4,"changes":[{"path":"/users/alice/age","value":31}]}
-# → {"type":"change","version":5,"changes":[{"path":"/users/alice/nick","removed":true}]}
+# → {"type":"change","version":4,"patch":[{"op":"replace","path":"/age","value":31}]}
+# → {"type":"change","version":5,"patch":[{"op":"remove","path":"/nick"}]}
+
+# Or RFC 7396 merge patches (arrays replace wholesale; null means delete)
+websocat 'ws://localhost:8080/ws?path=/users/alice&format=merge-patch'
+# → {"type":"change","version":6,"merge":{"age":33,"nick":null}}
 ```
 
 Formula grammar: `+ - * /`, parentheses, unary minus, numeric literals,

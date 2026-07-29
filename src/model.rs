@@ -173,6 +173,12 @@ impl Pointer {
         t.extend(other.0.iter().cloned());
         Pointer(t)
     }
+
+    /// This pointer expressed relative to `base` (None if not under it).
+    pub fn relative_to(&self, base: &Pointer) -> Option<Pointer> {
+        base.is_prefix_of(self)
+            .then(|| Pointer(self.0[base.0.len()..].to_vec()))
+    }
 }
 
 impl fmt::Display for Pointer {
@@ -377,6 +383,76 @@ pub fn diff_paths(old: &Arc<Node>, new: &Arc<Node>, base: &Pointer, out: &mut Ve
             }
         }
         _ => out.push(base.clone()),
+    }
+}
+
+/// Apply an RFC 7396 JSON Merge Patch to `target`, returning the merged
+/// node. Object members merge recursively (null members delete); anything
+/// else — including `{"$formula": ...}` literals — replaces wholesale.
+pub fn merge_value(target: Option<&Arc<Node>>, patch: &Value) -> Arc<Node> {
+    if let Value::Object(map) = patch {
+        if let Some(Value::String(_)) = map.get(FORMULA_KEY) {
+            return from_value(patch); // formula literal is a leaf
+        }
+        let mut out = match target.map(|t| &**t) {
+            Some(Node::Object(m)) => m.clone(),
+            _ => BTreeMap::new(),
+        };
+        for (k, v) in map {
+            if v.is_null() {
+                out.remove(k.as_str());
+            } else {
+                let merged = merge_value(out.get(k.as_str()), v);
+                out.insert(k.clone(), merged);
+            }
+        }
+        return Arc::new(Node::Object(out));
+    }
+    from_value(patch)
+}
+
+/// Produce the minimal RFC 7396 merge patch that turns `old` into `new`
+/// (in plain, formula-resolved terms). Returns None when they are equal.
+/// Inherent RFC 7396 limits apply: arrays are replaced wholesale, and a
+/// member set to null is indistinguishable from a deleted member.
+pub fn merge_patch_diff(old: Option<&Arc<Node>>, new: Option<&Arc<Node>>) -> Option<Value> {
+    match (old, new) {
+        (None, None) => None,
+        (_, None) => Some(Value::Null),
+        (None, Some(n)) => Some(to_plain_value(n)),
+        (Some(o), Some(n)) => {
+            if Arc::ptr_eq(o, n) {
+                return None;
+            }
+            match (&**o, &**n) {
+                (Node::Object(a), Node::Object(b)) => {
+                    let mut m = Map::new();
+                    for (k, vb) in b {
+                        if let Some(d) = merge_patch_diff(a.get(k), Some(vb)) {
+                            m.insert(k.clone(), d);
+                        }
+                    }
+                    for k in a.keys() {
+                        if !b.contains_key(k) {
+                            m.insert(k.clone(), Value::Null);
+                        }
+                    }
+                    if m.is_empty() {
+                        None
+                    } else {
+                        Some(Value::Object(m))
+                    }
+                }
+                _ => {
+                    let (po, pn) = (to_plain_value(o), to_plain_value(n));
+                    if po == pn {
+                        None
+                    } else {
+                        Some(pn)
+                    }
+                }
+            }
+        }
     }
 }
 

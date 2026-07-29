@@ -580,19 +580,13 @@ function toast(msg, isErr) {
 }
 
 // ------------------------------------------------ websocket
-function relativePath(abs) {
-  // Server clamps change paths to our subtree, so abs is us or below us.
-  if (abs === state.pointer) return "";
-  return abs.slice(state.pointer.length);
-}
-
-// Change events are deltas: apply each {path, value|removed} entry to the
-// local copy established by the snapshot.
-function applyChanges(changes) {
-  for (const ch of changes) {
-    const toks = tokens(relativePath(ch.path));
+// Change events are RFC 6902 JSON Patches with paths relative to our
+// subscription root; apply them to the local copy from the snapshot.
+function applyPatch(ops) {
+  for (const op of ops) {
+    const toks = tokens(op.path);
     if (toks.length === 0) {
-      state.value = ch.removed ? null : ch.value;
+      state.value = op.op === "remove" ? null : op.value;
       continue;
     }
     if (state.value === null || typeof state.value !== "object") state.value = {};
@@ -605,13 +599,14 @@ function applyChanges(changes) {
       cur = cur[t];
     }
     const last = toks[toks.length - 1];
-    if (ch.removed) {
+    if (op.op === "remove") {
       if (Array.isArray(cur)) cur.splice(Number(last), 1);
       else delete cur[last];
     } else if (Array.isArray(cur)) {
-      cur[Number(last)] = ch.value;
+      if (op.op === "add") cur.splice(last === "-" ? cur.length : Number(last), 0, op.value);
+      else cur[Number(last)] = op.value;
     } else {
-      cur[last] = ch.value;
+      cur[last] = op.value;
     }
   }
 }
@@ -631,15 +626,15 @@ function connect() {
       logEvent(msg.version, msg.resync ? "resync snapshot" : "initial snapshot", true);
       if (!state.editing) render();
     } else if (msg.type === "change") {
-      applyChanges(msg.changes);
+      applyPatch(msg.patch);
       setVersion(msg.version);
-      logEvent(msg.version, msg.changes.map((c) => c.path + (c.removed ? " ✕" : "")).join("  "));
+      logEvent(msg.version, msg.patch.map((o) => o.op + " " + (o.path || "/")).join("  "));
       if (state.editing) {
         const note = $("#staleNote");
         note.textContent = "⚠ v" + msg.version + " arrived while editing — saving will overwrite it";
         note.classList.add("show");
       } else {
-        render(msg.changes.map((c) => relativePath(c.path)));
+        render(msg.patch.map((o) => o.path));
       }
     }
   };

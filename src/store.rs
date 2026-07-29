@@ -43,6 +43,8 @@ pub enum Op {
     Remove { path: String },
     /// Append `value` to the array at `path` (creating the array if absent).
     Append { path: String, value: Value },
+    /// Apply `value` as an RFC 7396 JSON Merge Patch at `path`.
+    Merge { path: String, value: Value },
 }
 
 /// A precondition for a transactional commit: the plain value at `path` must
@@ -103,23 +105,14 @@ pub fn apply_ops(root: &Arc<Node>, ops: &[Op]) -> Result<(Arc<Node>, BTreeSet<Po
                 let new = from_value(value);
                 let old = get_at(&r, &p);
                 r = set_at(&r, &p, new.clone())?;
-                match old {
-                    // Replacing an existing subtree: record only what
-                    // actually differs, so rewriting a mostly-identical
-                    // object doesn't flag untouched fields as changed.
-                    Some(old) => {
-                        let mut diff = Vec::new();
-                        model::diff_paths(&old, &new, &p, &mut diff);
-                        if diff.len() > MAX_DIFF_PATHS {
-                            changed.insert(p);
-                        } else {
-                            changed.extend(diff);
-                        }
-                    }
-                    None => {
-                        changed.insert(p);
-                    }
-                }
+                record_replacement(&mut changed, old.as_ref(), &new, p);
+            }
+            Op::Merge { path, value } => {
+                let p = Pointer::parse(path)?;
+                let old = get_at(&r, &p);
+                let new = model::merge_value(old.as_ref(), value);
+                r = set_at(&r, &p, new.clone())?;
+                record_replacement(&mut changed, old.as_ref(), &new, p);
             }
             Op::Insert { path, value } => {
                 let p = Pointer::parse(path)?;
@@ -161,6 +154,31 @@ pub fn apply_ops(root: &Arc<Node>, ops: &[Op]) -> Result<(Arc<Node>, BTreeSet<Po
         }
     }
     Ok((r, changed))
+}
+
+/// Record the changed paths for a subtree replacement at `p`: a structural
+/// diff against the old subtree when one existed (collapsing to `p` past
+/// MAX_DIFF_PATHS), or `p` itself for a brand-new subtree.
+fn record_replacement(
+    changed: &mut BTreeSet<Pointer>,
+    old: Option<&Arc<Node>>,
+    new: &Arc<Node>,
+    p: Pointer,
+) {
+    match old {
+        Some(old) => {
+            let mut diff = Vec::new();
+            model::diff_paths(old, new, &p, &mut diff);
+            if diff.len() > MAX_DIFF_PATHS {
+                changed.insert(p);
+            } else {
+                changed.extend(diff);
+            }
+        }
+        None => {
+            changed.insert(p);
+        }
+    }
 }
 
 /// If `p` addresses an element of an array, return the array's path.
@@ -251,6 +269,17 @@ impl Store {
             vec![Op::Append {
                 path: path.into(),
                 value,
+            }],
+            &[],
+        )
+    }
+
+    /// Apply an RFC 7396 JSON Merge Patch at `path`.
+    pub fn merge(&self, path: &str, patch: Value) -> Result<CommitInfo> {
+        self.commit(
+            vec![Op::Merge {
+                path: path.into(),
+                value: patch,
             }],
             &[],
         )

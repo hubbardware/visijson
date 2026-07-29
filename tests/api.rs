@@ -331,14 +331,15 @@ async fn websocket_snapshot_then_ordered_filtered_changes() {
     let v2 = seen[1]["version"].as_u64().unwrap();
     assert!(v1 > snap_version);
     assert!(v2 > v1);
-    // Deltas carry only the changed path's new value — never siblings.
+    // Deltas are RFC 6902 patches relative to the subscription root, and
+    // carry only the changed path's new value — never siblings.
     assert_eq!(
-        seen[0]["changes"],
-        json!([{"path": "/watched/n", "value": 1}])
+        seen[0]["patch"],
+        json!([{"op": "replace", "path": "/n", "value": 1}])
     );
     assert_eq!(
-        seen[1]["changes"],
-        json!([{"path": "/watched/n", "value": 2}])
+        seen[1]["patch"],
+        json!([{"op": "replace", "path": "/n", "value": 2}])
     );
 
     ws.send(Message::Close(None)).await.unwrap();
@@ -374,8 +375,119 @@ async fn websocket_subscribers_watching_different_paths() {
         let msg = s.next().await.unwrap().unwrap();
         serde_json::from_str::<Value>(msg.to_text().unwrap()).unwrap()
     }
+    // Subscribed directly at /a and /b, so the patch path is the root: "".
     let a_msg = next(&mut ws_a).await;
-    assert_eq!(a_msg["changes"], json!([{"path": "/a", "value": 1}]));
+    assert_eq!(a_msg["patch"], json!([{"op": "replace", "path": "", "value": 1}]));
     let b_msg = next(&mut ws_b).await;
-    assert_eq!(b_msg["changes"], json!([{"path": "/b", "value": 2}]));
+    assert_eq!(b_msg["patch"], json!([{"op": "replace", "path": "", "value": 2}]));
+}
+
+#[tokio::test]
+async fn websocket_json_patch_add_and_remove_ops() {
+    let (base, store) = serve().await;
+    store.put("/w", json!({"keep": 1, "gone": 2})).unwrap();
+    let ws_url = format!("{}/ws?path=/w", base.replace("http", "ws"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws.next().await; // snapshot
+
+    store.put("/w/fresh", json!("new")).unwrap();
+    store.remove("/w/gone").unwrap();
+    store.append("/w/list", json!(1)).unwrap(); // creates the array
+    store.append("/w/list", json!(2)).unwrap(); // appends → RFC 6902 add
+
+    let mut patches = Vec::new();
+    while patches.len() < 4 {
+        let msg = ws.next().await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        patches.push(v["patch"].clone());
+    }
+    assert_eq!(patches[0], json!([{"op": "add", "path": "/fresh", "value": "new"}]));
+    assert_eq!(patches[1], json!([{"op": "remove", "path": "/gone"}]));
+    assert_eq!(patches[2], json!([{"op": "add", "path": "/list", "value": [1]}]));
+    assert_eq!(patches[3], json!([{"op": "add", "path": "/list/1", "value": 2}]));
+}
+
+#[tokio::test]
+async fn websocket_merge_patch_format() {
+    let (base, store) = serve().await;
+    store
+        .put("/w", json!({"a": 1, "b": {"x": 1, "y": 2}, "gone": true}))
+        .unwrap();
+    let ws_url = format!("{}/ws?path=/w&format=merge-patch", base.replace("http", "ws"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws.next().await; // snapshot
+
+    // One commit touching a nested field, deleting a key, and leaving the
+    // rest alone → minimal RFC 7396 merge patch.
+    store
+        .put("/w", json!({"a": 1, "b": {"x": 9, "y": 2}}))
+        .unwrap();
+    let msg = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "change");
+    assert_eq!(v["merge"], json!({"b": {"x": 9}, "gone": null}));
+
+    // Unknown format is rejected before upgrade.
+    let bad = format!("{}/ws?path=/w&format=bogus", base.replace("http", "ws"));
+    assert!(tokio_tungstenite::connect_async(&bad).await.is_err());
+}
+
+#[tokio::test]
+async fn rest_merge_patch() {
+    let (base, _store) = serve().await;
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base}/doc/users"))
+        .json(&json!({"alice": {"age": 30, "tags": ["admin"]}, "bob": {"age": 44}}))
+        .send()
+        .await
+        .unwrap();
+
+    // Explicit RFC 7396 content type: merge nested, delete via null.
+    let resp = client
+        .patch(format!("{base}/doc/users"))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"alice": {"age": 31}, "bob": null, "carol": {"new": true}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let info: Value = resp.json().await.unwrap();
+    // Changed paths are diffed precisely — alice/tags untouched.
+    assert_eq!(
+        info["changed_paths"],
+        json!(["/users/alice/age", "/users/bob", "/users/carol"])
+    );
+    let v: Value = client
+        .get(format!("{base}/doc/users"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v,
+        json!({"alice": {"age": 31, "tags": ["admin"]}, "carol": {"new": true}})
+    );
+
+    // Sniffed: plain application/json with an object body is a merge patch.
+    let resp = client
+        .patch(format!("{base}/doc/users"))
+        .json(&json!({"carol": {"new": false}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = client
+        .get(format!("{base}/doc/users/carol/new"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, json!(false));
 }

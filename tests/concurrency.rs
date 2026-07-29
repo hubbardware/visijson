@@ -38,14 +38,15 @@ fn concurrent_transactional_increments_lose_no_updates() {
         })
         .collect();
 
+    // The invariant is the count: every increment must land exactly once.
+    // (Retry counts vary with scheduling — the deterministic proof of the
+    // conflict/retry path is read_modify_write_conflict_forces_retry.)
     let total_retries: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
     assert_eq!(
         store.get("/counter").unwrap(),
         Some(json!((THREADS * INCREMENTS) as i64))
     );
-    // With 8 threads hammering one key, at least some retries must occur —
-    // proving the conflict path is exercised, not silently lost updates.
-    assert!(total_retries > 0, "expected contention to cause retries");
+    println!("total retries under contention: {total_retries}");
 }
 
 #[test]

@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::error::StoreError;
 use crate::model::{get_at, to_plain_value, Pointer};
 use crate::store::{Condition, Op, Store};
+use crate::subscriptions::CommitEvent;
 
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
@@ -225,21 +226,46 @@ fn patch_to_ops(prefix: &str, patch: Vec<PatchOp>) -> Result<(Vec<Op>, Vec<Condi
     Ok((ops, conditions))
 }
 
-async fn patch_root(State(store): State<Arc<Store>>, Json(patch): Json<Vec<PatchOp>>) -> ApiResult {
-    apply_patch(store, String::new(), patch).await
+async fn patch_root(
+    State(store): State<Arc<Store>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    apply_patch(store, String::new(), headers, body).await
 }
 
 async fn patch_path(
     State(store): State<Arc<Store>>,
     Path(path): Path<String>,
-    Json(patch): Json<Vec<PatchOp>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> ApiResult {
-    apply_patch(store, pointer_of(&path), patch).await
+    apply_patch(store, pointer_of(&path), headers, body).await
 }
 
-async fn apply_patch(store: Arc<Store>, prefix: String, patch: Vec<PatchOp>) -> ApiResult {
-    let (ops, conditions) = patch_to_ops(&prefix, patch)?;
-    Ok(Json(store.commit(ops, &conditions)?).into_response())
+/// PATCH speaks both standards. `application/json-patch+json` (RFC 6902) and
+/// `application/merge-patch+json` (RFC 7396) select explicitly; a plain JSON
+/// content type is sniffed — an array must be a JSON Patch, anything else is
+/// a merge patch.
+async fn apply_patch(
+    store: Arc<Store>,
+    prefix: String,
+    headers: HeaderMap,
+    body: Value,
+) -> ApiResult {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_json_patch = ct.starts_with("application/json-patch+json")
+        || (!ct.starts_with("application/merge-patch+json") && body.is_array());
+    if is_json_patch {
+        let patch: Vec<PatchOp> = serde_json::from_value(body).map_err(StoreError::Serde)?;
+        let (ops, conditions) = patch_to_ops(&prefix, patch)?;
+        Ok(Json(store.commit(ops, &conditions)?).into_response())
+    } else {
+        Ok(Json(store.merge(&prefix, body)?).into_response())
+    }
 }
 
 // ------------------------------------------------------------------ /txn
@@ -322,6 +348,17 @@ fn rfc3339(t: SystemTime) -> String {
 struct WsQuery {
     #[serde(default)]
     path: String,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// Wire format for change events.
+#[derive(Clone, Copy)]
+enum WsFormat {
+    /// RFC 6902 JSON Patch, paths relative to the subscription root.
+    JsonPatch,
+    /// RFC 7396 JSON Merge Patch against the subscribed subtree.
+    MergePatch,
 }
 
 async fn ws_handler(
@@ -333,7 +370,17 @@ async fn ws_handler(
         Ok(p) => p,
         Err(e) => return ApiError(e).into_response(),
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, store, ptr))
+    let format = match q.format.as_deref() {
+        None | Some("json-patch") => WsFormat::JsonPatch,
+        Some("merge-patch") => WsFormat::MergePatch,
+        Some(other) => {
+            return ApiError(StoreError::Unsupported(format!(
+                "format `{other}` (use json-patch or merge-patch)"
+            )))
+            .into_response()
+        }
+    };
+    ws.on_upgrade(move |socket| handle_ws(socket, store, ptr, format))
 }
 
 fn value_at(root: &Arc<crate::model::Node>, ptr: &Pointer) -> Value {
@@ -342,8 +389,61 @@ fn value_at(root: &Arc<crate::model::Node>, ptr: &Pointer) -> Value {
         .unwrap_or(Value::Null)
 }
 
-async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer) {
+/// Encode a change event as an RFC 6902 JSON Patch relative to `sub`.
+/// `old_root` is the tree as of the previous event (or snapshot), letting us
+/// distinguish add/replace/remove and skip no-ops. None = nothing relevant.
+fn json_patch_event(sub: &Pointer, old_root: &Arc<crate::model::Node>, ev: &CommitEvent) -> Option<Value> {
+    let mut targets = std::collections::BTreeSet::new();
+    for c in ev.changed_paths.iter() {
+        let Ok(c) = Pointer::parse(c) else { continue };
+        if !sub.overlaps(&c) {
+            continue;
+        }
+        // Clamp to the subscription root when an ancestor changed.
+        targets.insert(if sub.is_prefix_of(&c) { c } else { sub.clone() });
+    }
+    let mut patch = Vec::new();
+    for t in &targets {
+        let rel = t.relative_to(sub).expect("target is always under sub");
+        let (old, new) = (get_at(old_root, t), get_at(&ev.committed.root, t));
+        match (old, new) {
+            (None, Some(n)) => patch.push(json!({
+                "op": "add", "path": rel.to_string(), "value": to_plain_value(&n),
+            })),
+            (Some(o), Some(n)) => {
+                if !crate::model::nodes_equal(&o, &n) {
+                    patch.push(json!({
+                        "op": "replace", "path": rel.to_string(), "value": to_plain_value(&n),
+                    }));
+                }
+            }
+            (Some(_), None) => patch.push(json!({"op": "remove", "path": rel.to_string()})),
+            (None, None) => {}
+        }
+    }
+    if patch.is_empty() {
+        return None;
+    }
+    Some(json!({"type": "change", "version": ev.version, "patch": patch}))
+}
+
+/// Encode a change event as an RFC 7396 JSON Merge Patch for the subtree.
+fn merge_patch_event(sub: &Pointer, old_root: &Arc<crate::model::Node>, ev: &CommitEvent) -> Option<Value> {
+    let relevant = ev.changed_paths.iter().any(|c| {
+        Pointer::parse(c).map(|c| sub.overlaps(&c)).unwrap_or(false)
+    });
+    if !relevant {
+        return None;
+    }
+    let old = get_at(old_root, sub);
+    let new = get_at(&ev.committed.root, sub);
+    let merge = crate::model::merge_patch_diff(old.as_ref(), new.as_ref())?;
+    Some(json!({"type": "change", "version": ev.version, "merge": merge}))
+}
+
+async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer, format: WsFormat) {
     let (snapshot, mut rx) = store.subscribe();
+    let mut last_root = snapshot.root.clone();
     let hello = json!({
         "type": "snapshot",
         "version": snapshot.version,
@@ -357,33 +457,12 @@ async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer) {
         tokio::select! {
             event = rx.recv() => match event {
                 Ok(ev) => {
-                    // Deltas only: for each relevant changed path, ship the
-                    // new value at that path (clamped to the subscription
-                    // root when an ancestor changed). Untouched siblings are
-                    // never re-sent; the snapshot established base state.
-                    let mut targets = std::collections::BTreeSet::new();
-                    for c in ev.changed_paths.iter() {
-                        let Ok(c) = Pointer::parse(c) else { continue };
-                        if !ptr.overlaps(&c) {
-                            continue;
-                        }
-                        targets.insert(if ptr.is_prefix_of(&c) { c } else { ptr.clone() });
-                    }
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let changes: Vec<Value> = targets
-                        .iter()
-                        .map(|t| match get_at(&ev.committed.root, t) {
-                            Some(n) => json!({"path": t.to_string(), "value": to_plain_value(&n)}),
-                            None => json!({"path": t.to_string(), "removed": true}),
-                        })
-                        .collect();
-                    let msg = json!({
-                        "type": "change",
-                        "version": ev.version,
-                        "changes": changes,
-                    });
+                    let msg = match format {
+                        WsFormat::JsonPatch => json_patch_event(&ptr, &last_root, &ev),
+                        WsFormat::MergePatch => merge_patch_event(&ptr, &last_root, &ev),
+                    };
+                    last_root = ev.committed.root.clone();
+                    let Some(msg) = msg else { continue };
                     if socket.send(Message::Text(msg.to_string())).await.is_err() {
                         return;
                     }
@@ -394,6 +473,7 @@ async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer) {
                     tracing::warn!(missed = n, "subscriber lagged; resyncing");
                     let (snap, new_rx) = store.subscribe();
                     rx = new_rx;
+                    last_root = snap.root.clone();
                     let msg = json!({
                         "type": "snapshot",
                         "version": snap.version,

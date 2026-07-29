@@ -110,6 +110,40 @@ fn array_insert_and_remove_report_the_whole_array() {
 }
 
 #[test]
+fn merge_op_follows_rfc7396() {
+    let store = Store::in_memory();
+    store
+        .put("", json!({"title": "Goodbye!", "author": {"givenName": "John", "familyName": "Doe"},
+                        "tags": ["example", "sample"], "content": "This will be unchanged"}))
+        .unwrap();
+
+    // The example straight from RFC 7396 §1.
+    let info = store
+        .merge(
+            "",
+            json!({"title": "Hello!", "phoneNumber": "+01-123-456-7890",
+                   "author": {"familyName": null}, "tags": ["example"]}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.get("").unwrap(),
+        Some(json!({"title": "Hello!", "author": {"givenName": "John"},
+                    "tags": ["example"], "content": "This will be unchanged",
+                    "phoneNumber": "+01-123-456-7890"}))
+    );
+    assert_eq!(
+        info.changed_paths,
+        vec!["/author/familyName", "/phoneNumber", "/tags", "/title"]
+    );
+
+    // Non-object patch replaces wholesale; merge into a scalar treats it as {}.
+    store.merge("/tags", json!("just a string")).unwrap();
+    assert_eq!(store.get("/tags").unwrap(), Some(json!("just a string")));
+    store.merge("/tags", json!({"now": "object"})).unwrap();
+    assert_eq!(store.get("/tags").unwrap(), Some(json!({"now": "object"})));
+}
+
+#[test]
 fn identical_put_does_not_wake_formulas() {
     let store = Store::in_memory();
     store.put("/a", json!(5)).unwrap();
