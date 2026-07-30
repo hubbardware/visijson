@@ -436,13 +436,28 @@ function flashRows(changedRel) {
 }
 
 // ------------------------------------------------ inline scalar editing
-function inlineEdit(span, current, relPath) {
+// The live view is plain (formulas already resolved), so before editing we
+// fetch the raw node: a formula edits as its expression, spreadsheet-style.
+// The input shows `=expr`, and any saved value starting with `=` becomes a
+// formula — which also lets you create one on any scalar.
+async function inlineEdit(span, current, relPath) {
   if (state.editing || state.inlineEditing) return;
   state.inlineEditing = true;
+  let display = JSON.stringify(current);
+  try {
+    const resp = await fetch(docUrl(state.pointer + relPath) + "?raw=true", {
+      headers: { accept: "application/json" },
+    });
+    if (resp.ok) {
+      const raw = await resp.json();
+      if (raw && typeof raw === "object" && "$formula" in raw) display = "=" + raw["$formula"];
+    }
+  } catch { /* fetch failed — fall back to editing the plain value */ }
   const input = document.createElement("input");
   input.className = "inline-input";
-  input.value = JSON.stringify(current);
+  input.value = display;
   input.size = Math.max(input.value.length + 2, 8);
+  input.title = "start with = to write a formula";
   span.replaceWith(input);
   input.focus();
   input.select();
@@ -450,10 +465,14 @@ function inlineEdit(span, current, relPath) {
     if (!state.inlineEditing) return;
     state.inlineEditing = false;
     if (commit) {
-      let parsed;
       const raw = input.value.trim();
-      try { parsed = JSON.parse(raw); } catch { parsed = raw; } // bare words → string
-      putValue(state.pointer + relPath, parsed);
+      if (raw.startsWith("=")) {
+        putValue(state.pointer + relPath, { "$formula": raw.slice(1).trim() });
+      } else {
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch { parsed = raw; } // bare words → string
+        putValue(state.pointer + relPath, parsed);
+      }
     }
     render(state.pendingChanged);
     state.pendingChanged = null;
