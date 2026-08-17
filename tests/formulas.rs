@@ -185,3 +185,164 @@ fn raw_read_exposes_expression_and_cache() {
     assert_eq!(raw["$formula"], json!("/a + 1"));
     assert_eq!(raw["$value"], json!(2));
 }
+
+// ---------------------------------------------------------------- jq engine
+
+#[test]
+fn jq_extracts_player_names_as_array() {
+    let store = Store::in_memory();
+    store
+        .put(
+            "/players",
+            json!({
+                "u1": {"name": "alice", "age": 30, "level": 7},
+                "u2": {"name": "bob", "age": 25, "level": 3},
+            }),
+        )
+        .unwrap();
+
+    // Bare values, 1-field objects, n-field objects, keyed by uid.
+    store.put("/names", formula("jq(/players, '[.[] | .name]')")).unwrap();
+    store
+        .put("/cards", formula("jq(/players, '[.[] | {name, age}]')"))
+        .unwrap();
+    store
+        .put("/by_uid", formula("jq(/players, 'map_values({name})')"))
+        .unwrap();
+
+    assert_eq!(store.get("/names").unwrap(), Some(json!(["alice", "bob"])));
+    assert_eq!(
+        store.get("/cards").unwrap(),
+        Some(json!([
+            {"name": "alice", "age": 30},
+            {"name": "bob", "age": 25},
+        ]))
+    );
+    assert_eq!(
+        store.get("/by_uid").unwrap(),
+        Some(json!({"u1": {"name": "alice"}, "u2": {"name": "bob"}}))
+    );
+}
+
+#[test]
+fn jq_reevaluates_when_scope_changes_only() {
+    let store = Store::in_memory();
+    store.put("/players/u1/name", json!("alice")).unwrap();
+    store.put("/other", json!(0)).unwrap();
+    store.put("/names", formula("jq(/players, '[.[] | .name]')")).unwrap();
+    assert_eq!(store.get("/names").unwrap(), Some(json!(["alice"])));
+
+    // A new player under the scope re-evaluates the view.
+    let info = store.put("/players/u2/name", json!("bob")).unwrap();
+    assert!(info.changed_paths.contains(&"/names".to_string()));
+    assert_eq!(store.get("/names").unwrap(), Some(json!(["alice", "bob"])));
+
+    // Writes outside the scope leave the formula untouched.
+    let info = store.put("/other", json!(1)).unwrap();
+    assert_eq!(info.changed_paths, vec!["/other"]);
+}
+
+#[test]
+fn jq_composes_with_numeric_functions() {
+    let store = Store::in_memory();
+    store
+        .put("/players", json!({"u1": {"age": 30}, "u2": {"age": 20}}))
+        .unwrap();
+    store
+        .put("/avg_age", formula("sum(jq(/players, '[.[] | .age]')) / count(jq(/players, '[.[] | .age]'))"))
+        .unwrap();
+    assert_eq!(store.get("/avg_age").unwrap(), Some(json!(25)));
+}
+
+#[test]
+fn jq_errors_surface_and_heal() {
+    let store = Store::in_memory();
+    // Missing scope → #ERR that heals when the scope appears.
+    store.put("/names", formula("jq(/players, '[.[] | .name]')")).unwrap();
+    let v = store.get("/names").unwrap().unwrap();
+    assert!(v.as_str().unwrap().starts_with("#ERR"), "got {v}");
+    store.put("/players/u1/name", json!("alice")).unwrap();
+    assert_eq!(store.get("/names").unwrap(), Some(json!(["alice"])));
+
+    // A stream of outputs is rejected with a hint, not silently truncated.
+    store.put("/players/u2/name", json!("bob")).unwrap();
+    store.put("/stream", formula("jq(/players, '.[] | .name')")).unwrap();
+    let v = store.get("/stream").unwrap().unwrap();
+    assert!(v.as_str().unwrap().contains("[...]"), "got {v}");
+
+    // Broken programs are a parse-time #ERR, not a rejected commit.
+    store.put("/broken", formula("jq(/players, '][')")).unwrap();
+    let v = store.get("/broken").unwrap().unwrap();
+    assert!(v.as_str().unwrap().starts_with("#ERR"), "got {v}");
+}
+
+#[test]
+fn jq_view_depending_on_own_scope_is_a_cycle() {
+    let store = Store::in_memory();
+    store.put("/players/u1/name", json!("alice")).unwrap();
+    // A formula inside its own scope must be rejected as a cycle.
+    let err = store
+        .put("/players/view", formula("jq(/players, '[.[]]')"))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::FormulaCycle(_)), "got {err:?}");
+}
+
+// ------------------------------------------------- formula index maintenance
+
+#[test]
+fn formula_in_array_survives_sibling_insert_shift() {
+    use jsondocstore::store::Op;
+    let store = Store::in_memory();
+    store.put("/x", json!(1)).unwrap();
+    store.put("/arr", json!([{"$formula": "/x + 1"}, "plain"])).unwrap();
+    assert_eq!(store.get("/arr/0").unwrap(), Some(json!(2)));
+
+    // Insert at the front: the formula shifts to /arr/1. The index must
+    // follow it, so a dependency change still finds and updates it.
+    store
+        .commit(
+            vec![Op::Insert {
+                path: "/arr/0".into(),
+                value: jsondocstore::model::from_value(&json!("first")),
+            }],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(store.get("/arr/1").unwrap(), Some(json!(2)));
+    store.put("/x", json!(10)).unwrap();
+    assert_eq!(store.get("/arr/1").unwrap(), Some(json!(11)));
+}
+
+#[test]
+fn formulas_created_and_destroyed_by_deep_subtree_writes() {
+    let store = Store::in_memory();
+    // Formula born inside a larger object write, not written directly.
+    store
+        .put("/data", json!({"a": {"f": {"$formula": "/data/a/x * 2"}, "x": 3}}))
+        .unwrap();
+    assert_eq!(store.get("/data/a/f").unwrap(), Some(json!(6)));
+    store.put("/data/a/x", json!(5)).unwrap();
+    assert_eq!(store.get("/data/a/f").unwrap(), Some(json!(10)));
+
+    // Overwriting the subtree destroys the formula; later dependency
+    // changes must not resurrect it or flag it as changed.
+    store.put("/data", json!({"a": {"x": 7}})).unwrap();
+    assert_eq!(store.get("/data/a/f").unwrap(), None);
+    let info = store.put("/data/a/x", json!(8)).unwrap();
+    assert_eq!(info.changed_paths, vec!["/data/a/x"]);
+}
+
+#[test]
+fn merge_patch_can_create_and_delete_formulas() {
+    let store = Store::in_memory();
+    store.put("/x", json!(2)).unwrap();
+    store
+        .merge("", json!({"calc": {"$formula": "/x * 10"}}))
+        .unwrap();
+    assert_eq!(store.get("/calc").unwrap(), Some(json!(20)));
+
+    store.merge("", json!({"calc": null})).unwrap();
+    assert_eq!(store.get("/calc").unwrap(), None);
+    let info = store.put("/x", json!(3)).unwrap();
+    assert_eq!(info.changed_paths, vec!["/x"]);
+}

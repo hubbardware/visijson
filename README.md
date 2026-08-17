@@ -16,15 +16,28 @@ Features:
 - **Optimistic transactions** — read-set validation with automatic retry
   (Rust closure API) and conditional commits (`test` ops / `conditions`) over
   REST
-- **WebSocket subscriptions by path** — consistent initial snapshot followed
-  by gap-free, strictly version-ordered **standard patch** events: RFC 6902
-  JSON Patch by default (paths relative to the subscription root, directly
-  applicable with any JSON Patch library), or RFC 7396 JSON Merge Patch with
-  `?format=merge-patch`. Only changed paths are shipped, never untouched
+- **WebSocket subscriptions by path** — upgrade the document URL itself
+  (`ws://…/doc/users/alice`); no separate endpoint. A consistent initial
+  snapshot is followed by gap-free, strictly version-ordered **standard
+  patch** events: RFC 6902 JSON Patch by default (paths relative to the
+  subscription root, directly applicable with any JSON Patch library), or
+  RFC 7396 JSON Merge Patch via the `merge-patch` WebSocket subprotocol
+  (`Sec-WebSocket-Protocol`). Only changed paths are shipped, never untouched
   siblings; every commit records its precisely-diffed changed paths
+- **Server-Sent Events** — the same subscription over plain HTTP: request any
+  document URL with `Accept: text/event-stream` (exactly what the browser
+  `EventSource` API sends). Identical snapshot/change payloads, commit
+  versions as SSE event ids, automatic resync on lag; merge-patch format via
+  an Accept parameter (`text/event-stream;patch=merge-patch`)
 - **Formula nodes** — spreadsheet-style expressions over pointer references
   with dependency tracking, topological re-evaluation, and cycle detection
-  (cycles reject the commit)
+  (cycles reject the commit); embedded **jq** (`jq(/scope, 'program')` via
+  jaq) for projections and reshaping — extract `[.[] | .name]` slices or
+  `map_values({name, age})` keyed views of a subtree
+- **HTTP caching** — every read carries an `ETag` (the version of the last
+  commit that touched *that subtree*) and `Last-Modified`; `If-None-Match`
+  and `If-Modified-Since` answer `304`. A write elsewhere in the document
+  does not invalidate your path
 - **Durability** — append-only WAL (one JSON line per commit) + periodic
   snapshots with atomic rotation; recovery on startup replays snapshot + WAL,
   tolerating a torn WAL tail
@@ -42,10 +55,12 @@ Features:
 
 ## Live web UI
 
-Open any document path in a browser — `http://localhost:8080/doc` or
-`/doc/any/sub/path` — and the server content-negotiates an embedded
-single-file UI (API clients still get JSON; `?raw=true` forces JSON from the
-address bar). The page subscribes to that subtree over the WebSocket and:
+Every document URL is fully content-negotiated: a WebSocket upgrade
+subscribes, `Accept: text/event-stream` subscribes over SSE, an `Accept`
+preferring `text/html` (a browser) gets an embedded single-file UI, and
+everything else gets JSON (`?raw=true` forces JSON from the address bar).
+So opening `http://localhost:8080/doc` or `/doc/any/sub/path` in a browser
+serves the UI, which then subscribes to the same URL over WebSocket and:
 
 - renders the value as a navigable JSON tree (keys link deeper, breadcrumbs
   link up), live-updating with per-row flashes on every relevant commit
@@ -54,10 +69,15 @@ address bar). The page subscribes to that subtree over the WebSocket and:
 - shows connection status, current version, and a change-event log
 - reconnects automatically with backoff, resyncing via a fresh snapshot
 
-The server also maintains a liveness node at `/info` — wall-clock time
-(RFC 3339), epoch millis, uptime, and start time — rewritten once per second
-(`INFO_TICK_SECS`, `0` disables). Watching `/doc` in a browser therefore
-shows a heartbeat; `GET /doc/info/time` works as a liveness probe.
+The server also maintains liveness metadata at `/info` — a **sibling** of
+`/doc`, backed by its own in-memory store — wall-clock time (RFC 3339),
+epoch millis, uptime, and start time, rewritten once per second
+(`INFO_TICK_SECS`, `0` disables). It gets the same content negotiation:
+open `/info` in a browser for a live heartbeat, `GET /info/time` as a
+liveness probe, or subscribe to `ws://…/info`. It is read-only over HTTP,
+and because it is a separate store, document subscribers never see the
+ticker churn and it never touches the WAL — leverage it if you want it,
+ignore it if you don't.
 
 ## Running
 
@@ -100,24 +120,193 @@ curl -X PUT localhost:8080/doc/total -d '{"$formula": "sum(/cart/prices) * 1.08"
 curl localhost:8080/doc/total                      # computed number
 curl 'localhost:8080/doc/total?raw=true'           # {"$formula": ..., "$value": ...}
 
-# Subscribe: snapshot first, then RFC 6902 patches relative to the
-# subscription root — pipe them into any JSON Patch library as-is
-websocat 'ws://localhost:8080/ws?path=/users/alice'
-# → {"type":"snapshot","version":3,"path":"/users/alice","value":{...}}
+# Subscribe by upgrading the document URL itself: snapshot first, then
+# RFC 6902 patches relative to the subscription root — pipe them into any
+# JSON Patch library as-is
+websocat ws://localhost:8080/doc/users/alice
+# → {"type":"snapshot","version":3,"path":"/users/alice","exists":true,"value":{...}}
+# (subscribing to a path that doesn't exist yet is fine: the snapshot says
+#  "exists":false, and the path's creation arrives as an add event)
 # → {"type":"change","version":4,"patch":[{"op":"replace","path":"/age","value":31}]}
 # → {"type":"change","version":5,"patch":[{"op":"remove","path":"/nick"}]}
 
-# Or RFC 7396 merge patches (arrays replace wholesale; null means delete)
-websocat 'ws://localhost:8080/ws?path=/users/alice&format=merge-patch'
+# Or RFC 7396 merge patches (arrays replace wholesale; null means delete) —
+# the format is a WebSocket subprotocol, e.g. new WebSocket(url, "merge-patch")
+websocat --protocol merge-patch ws://localhost:8080/doc/users/alice
 # → {"type":"change","version":6,"merge":{"age":33,"nick":null}}
+
+# Same subscription over SSE — new EventSource("/doc/users/alice") in a
+# browser, or curl. Commit versions double as SSE event ids.
+curl -N -H 'accept: text/event-stream' localhost:8080/doc/users/alice
+# → id: 3
+# → data: {"type":"snapshot","version":3,"path":"/users/alice","exists":true,"value":{...}}
+# →
+# → id: 4
+# → data: {"type":"change","version":4,"patch":[...]}
+
+# Merge-patch format rides an Accept parameter (EventSource can't set custom
+# headers, so it always gets the json-patch default)
+curl -N -H 'accept: text/event-stream;patch=merge-patch' localhost:8080/doc/users/alice
 ```
 
-Formula grammar: `+ - * /`, parentheses, unary minus, numeric literals,
-pointer references (`/a/b`), and `sum` / `count` / `min` / `max` (scalars and
-arrays). A bare pointer expression mirrors any JSON value. Evaluation errors
-(missing ref, divide-by-zero) surface as `"#ERR: ..."` values and heal when
-the dependency is fixed; dependency cycles reject the writing commit (HTTP
-422).
+Formula grammar: `+ - * /`, parentheses, unary minus, numeric and string
+(`'...'` / `"..."`) literals, pointer references (`/a/b`), and
+`sum` / `count` / `min` / `max` (scalars and arrays). A bare pointer
+expression mirrors any JSON value. Evaluation errors (missing ref,
+divide-by-zero) surface as `"#ERR: ..."` values and heal when the dependency
+is fixed; dependency cycles reject the writing commit (HTTP 422).
+
+Query engines are formula functions of the form `engine(scope, 'program')`.
+`jq(...)` runs a jq program (via [jaq]) against the plain value of the
+subtree at `scope`; the scope pointer doubles as the formula's dependency,
+so it re-evaluates exactly when that subtree changes. The program must
+produce a single value — wrap streams in `[...]`. More engines can slot in
+as sibling functions later (`jmes(...)` is reserved for JMESPath).
+
+[jaq]: https://github.com/01mf02/jaq
+
+```sh
+# All player names, as a bare array
+curl -X PUT localhost:8080/doc/names -H 'content-type: application/json' \
+  -d "{\"\$formula\": \"jq(/players, '[.[] | .name]')\"}"
+
+# A keyed projection — uid → {name, level}. Prefer this shape for live
+# views: object keys are stable, so subscription diffs stay tiny (a name
+# change is `replace /u7/name`, never an array reshuffle).
+curl -X PUT localhost:8080/doc/roster -H 'content-type: application/json' \
+  -d "{\"\$formula\": \"jq(/players, 'map_values({name, level})')\"}"
+
+# Engines compose with the numeric functions
+#   sum(jq(/players, '[.[] | .age]')) / count(jq(/players, '[.[] | .age]'))
+```
+
+## Using it as a library
+
+The common types re-export at the crate root:
+
+```rust
+use jsondocstore::{Store, StoreConfig, Op, Condition, Document, TypedMount};
+```
+
+**Open a store** — `Store::in_memory()` for no persistence, or:
+
+```rust
+let store = Store::open(StoreConfig {
+    data_dir: Some("/var/lib/jds".into()),  // None disables persistence
+    fsync: true,                            // per-commit WAL fsync
+    max_retries: 64,                        // transaction retry budget
+})?;                                        // recovers snapshot + WAL
+store.snapshot()?;                          // write a snapshot, rotate the WAL
+```
+
+**Read** — lock-free against the current root:
+
+```rust
+store.get("/players/u1/age")?;   // Option<Value>, formulas resolved
+store.get_raw("/players/u1")?;   // Option<Value>, formulas as {"$formula","$value"}
+store.get_node("/players")?;     // Option<Arc<Node>> — zero-copy handle
+store.head();                    // Arc<Committed>: an immutable point-in-time
+                                 // snapshot of the whole document, valid forever
+store.version();                 // u64
+```
+
+**Write** — each call is one atomic commit returning
+`CommitInfo { version, changed_paths }`:
+
+```rust
+store.put("/a/b", json!(1))?;                 // Value in
+store.put_node("/a", node)?;                  // Arc<Node> in
+store.put_typed("/config", &config)?;         // any T: Serialize, no Value
+store.append("/log", json!("entry"))?;        // array append (creates the array)
+store.merge("/users", json!({"bob": null}))?; // RFC 7396 merge patch
+store.remove("/a/b")?;
+store.commit(ops, &conditions)?;              // batch of Ops + preconditions
+```
+
+**Optimistic transactions** — read-set validation with automatic retry:
+
+```rust
+let (out, info, retries) = store.transaction(|txn| {
+    let bal = txn.get("/bal")?.and_then(|v| v.as_i64()).unwrap_or(0);
+    txn.put("/bal", json!(bal - 30))?;
+    Ok(bal)
+})?;
+```
+
+**Subscribe** — a consistent snapshot plus every commit after it,
+version-ordered and gap-free:
+
+```rust
+let (snapshot, mut rx) = store.subscribe();
+while let Ok(ev) = rx.recv().await {
+    // ev: Arc<CommitEvent> { version, changed_paths, committed }
+}
+```
+
+**Embed the HTTP server** (optional): `api::router(doc, info)` is an axum
+`Router`; `api::spawn_info_ticker(info, period)` runs the heartbeat.
+
+Lower-level tree tools live in `jsondocstore::model`: `Pointer`,
+path-copy `get_at`/`set_at`/`insert_at`/`remove_at` on any root,
+`diff_paths`, `merge_patch_diff`, `reconcile`, `walk`, and `PlainView`
+(streaming formula-resolved serialization — pairs with `get_node`).
+
+### The typed fast lane
+
+Typed data gets a fast path in — while the tree stays the single source of
+truth (reads, subscriptions, formulas, and the WAL never see the typed
+layer). For poll-style syncing of big collections, derive `Document` and
+use a `TypedMount`: it retains the last synced value and diffs each new one
+against it **natively** — generated field-by-field comparisons, no
+serialization of anything unchanged — committing only minimal ops:
+
+```rust
+#[derive(Document, Clone)]
+struct Player { name: String, age: i64, level: i64 }
+
+let mut mount: TypedMount<BTreeMap<String, Player>> =
+    TypedMount::new(store.clone(), "/players")?;
+mount.sync(fetch_players()?)?; // first sync: one PUT of everything
+mount.sync(fetch_players()?)?; // after: native diff → minimal ops (or none)
+```
+
+At 20k entries × 110 fields (`examples/bench_diff.rs`), an unchanged sync
+costs ~44ms of pure comparison and commits nothing; a 3-field drift commits
+3 tiny ops — versus ~330–440ms for a full-replace PUT of the same data,
+typed or not, because a full replace must rebuild and re-compare the whole
+tree. Field types: integers, floats, `bool`, `String`, `Option` (`None` ⇢
+JSON null), `Vec` (same length diffs per index, length changes replace
+wholesale), string-keyed `BTreeMap`/`HashMap`, and nested
+`#[derive(Document)]` structs.
+
+## Conditional requests
+
+Reads are cacheable and precisely invalidated:
+
+```sh
+curl -i localhost:8080/doc/players/u1
+# → ETag: "742"
+# → Last-Modified: Sat, 08 Aug 2026 23:50:08 GMT
+# → Cache-Control: no-cache
+
+curl -i -H 'if-none-match: "742"' localhost:8080/doc/players/u1
+# → 304 Not Modified            (and stays 304 when /players/u2 changes)
+```
+
+The ETag is the version of the last commit whose changed paths **overlap**
+that subtree — the same relevance rule subscriptions use — so a write to a
+sibling leaves your cached copy valid. `?raw=true` is a distinct
+representation with its own ETag. `If-None-Match` takes precedence over
+`If-Modified-Since` (RFC 9110), weak comparison applies, and an
+unparseable date is ignored rather than trusted.
+
+Commit timestamps are persisted in the WAL and in snapshots, so
+`Last-Modified` survives restarts. The per-path index behind ETags is
+rebuilt on recovery — from the snapshot version as a floor, sharpened by
+every replayed commit — and always errs newer than the truth, so a stale
+`304` is impossible; the cost of imprecision is only a needless refetch.
+The same applies if the index hits its size cap and collapses to
+whole-store validators.
 
 ## Consistency model
 

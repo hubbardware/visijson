@@ -1,0 +1,201 @@
+# TODO
+
+## 1. Isolate document data from metadata at the URL root
+
+Top-level URL paths should be namespaces: `/doc`, `/info`, `/views`, and
+room for more.
+
+**Done (2026-08-06):** `/info` is now a sibling of `/doc`, backed by its own
+in-memory `Store` — full subscription semantics for free, read-only over
+HTTP, and the ticker churn no longer touches doc subscribers or the WAL.
+The document root is purely user data.
+
+Still open:
+- `/version` probably folds into `/info` (it reports the *doc* store's
+  version, so it would need to live in the info store as data, or `/info`
+  grows a computed member).
+- `/views` namespace arrives with #2.
+
+## 2. Materialized views under `/views`
+
+A connection should be able to create its own view of the data and read it
+under `/views/...` — like a materialized view, with all the existing
+subscription semantics (consistent snapshot, then gap-free version-ordered
+patches). Views are **read-only** through the API.
+
+**Direction decided (2026-08-06):** the definition language is the formula
+language. Query engines are formula functions of the form
+`engine(scope, 'program')` — the scope pointer *is* the dependency, so
+re-evaluation and cycle detection never inspect the program text.
+`jq(/players, '…')` (via jaq) is implemented; `jmes(...)` is reserved so
+JMESPath (guaranteed-terminating) can slot in beside it later. Update
+timing is *within* the commit, like all formulas. Prefer keyed
+(`map_values`) view shapes over arrays — stable keys keep subscription
+diffs small.
+
+Still open:
+- The `/views` namespace itself: a view today is just a formula stored in
+  the document; `/views` should mount view definitions outside user data,
+  read-only, probably per-connection or named.
+- Lifetime: tied to the creating connection, or persistent until deleted?
+- jq programs are re-parsed on each evaluation. Formula ASTs are worse —
+  see #7, which supersedes the AST half of this note; cache compiled jq
+  programs keyed by expression text alongside it.
+- ~~Get under the ~300ms full-replace floor~~ — done 2026-08-06, all three
+  rungs: (1) `Node` deserializes straight from JSON (no `Value`) and ops
+  carry `Arc<Node>`; (2) `typed::to_node` + `Store::put_typed` serialize
+  any `T: Serialize` directly into trees; (3) `#[derive(Document)]` +
+  `TypedMount` retain the last synced struct and diff natively — unchanged
+  20k × 110 sync ≈ 44ms and commits nothing; 3-field drift ≈ 35ms + 3 ops.
+  Still open if REST polling (not library mode) needs the same: a
+  reconciling *deserializer* that compares against the old tree while
+  parsing the request body.
+- ~~Path-copy cloning the 20k-entry parent map dominated single-field
+  PUTs (~1.2ms)~~ — done 2026-08-06: `Node::Object` is now `imbl::OrdMap`
+  (persistent B-tree: O(log n) path-copy, still sorted iteration).
+  Single-field PUT at 20k × 110 fields: ~26µs (`examples/bench_diff.rs`).
+- jq is Turing-ish (recursion); a hostile/buggy program can burn CPU inside
+  the commit path. Fine single-user; revisit with permissions (#6).
+
+## 3. Type out the SSE `event:` field
+
+SSE frames are currently unnamed (so `EventSource.onmessage` just works)
+and the payload carries `"type": "snapshot" | "change"` inside the JSON,
+mirroring the WebSocket messages. Later: formalize a taxonomy of named
+`event:` types (`snapshot`, `change`, maybe `error`/`resync`) so clients
+can `addEventListener` per type, document it, and keep the WS `type` field
+and SSE `event:` names in sync.
+
+## 4. UI: grey out edit controls where the user can't write
+
+The embedded UI shows edit/delete affordances everywhere, including
+read-only namespaces — on `/info` clicking one just earns a 405. Grey them
+out (or hide them) wherever the current user lacks write permission:
+`/info` today, and per-path once users/permissions exist (#6). The server
+needs to tell the page its rights — e.g. capability info in the snapshot
+message or an OPTIONS/Allow probe — rather than the UI hardcoding
+namespace names.
+
+## 5. Conditional requests: ETags / If-Modified-Since
+
+**Done (2026-08-08):** GETs carry `ETag` (last-modified version for that
+subtree), `Last-Modified`, and `Cache-Control: no-cache`; `If-None-Match`
+(weak comparison, `*`) and `If-Modified-Since` answer 304. Commits are
+timestamped (clamped monotonic) and the timestamps persist in WAL records
+and snapshots. `meta::ModIndex` answers per-path last-modified in
+O(depth) via `own`/`sub` stamps, is carried in `Committed` as a persistent
+map, and always over-estimates so a stale 304 is impossible.
+
+Still open:
+- `If-Match` / `If-Unmodified-Since` on writes. The `conditions` machinery
+  can express it (compare-and-set on a version) once a path's version is
+  addressable as a condition target — today conditions compare *values*.
+- The mod index isn't persisted, so a restart from a snapshot resets every
+  path to the floor and invalidates client caches once. Persisting it (or
+  a digest of it) alongside the snapshot would avoid that.
+- `MAX_ENTRIES` (200k) collapse is untested at scale; if a workload hits it
+  routinely, consider pruning by age instead of wholesale collapse.
+- The embedded UI and SSE/WS paths don't use validators (they don't need
+  to — they're live), but the UI's static HTML could carry its own ETag.
+
+## 6. Permissions / users
+
+Eventually needed. No design yet — auth on the HTTP layer, per-path ACLs on
+the store, or both. Interacts with #2 (who can create/see a view), #4 (the
+UI reflecting the user's rights), and #1 (metadata namespace probably
+shouldn't be writable by clients at all).
+
+---
+
+Items 7–10 came out of a 2026-08-17 trace of the concurrency, durability,
+and formula paths (prompted by comparing notes with an external
+"SuperJsonCalc" design aimed at write throughput). 7 and 8 are defects, not
+optimizations. Full assessment:
+`~/.claude/plans/i-worked-with-another-melodic-comet.md`.
+
+## 7. Formula evaluation is O(F²) per commit attempt
+
+`formulas::reevaluate` (formulas.rs:552-607) materializes entries for
+**every** formula in the document, re-parses every formula's expression
+text, and builds the whole dependency graph with a double loop — *before*
+narrowing to the dirty set at line 611. A document with F formulas pays
+`O(F·parse + F²·overlap)` on every commit attempt **even when the commit
+touches no formula**. For a spreadsheet-like workload this is the
+scalability ceiling. The `Committed.formulas` index made formula-free
+documents free (125ns); it did nothing for formula-*ful* ones.
+
+Fix: replace `BTreeSet<Pointer>` with an index carrying `dep-pointer →
+dependent formulas` plus cached parsed ASTs, both `imbl` persistent maps
+like `meta::ModIndex`. Overlap queries decompose into `depth` ancestor
+point-lookups plus one `OrdMap::range` descendant scan, so cost becomes
+proportional to the dirty set: seed from changed paths, BFS the transitive
+closure over reverse edges, build the graph over the dirty subgraph only.
+Also make the topo DFS iterative — it currently recurses over F and will
+overflow the stack at scale.
+
+One semantic narrowing to document and test: a *pre-existing* cycle in an
+untouched region would stop rejecting unrelated commits. Newly formed
+cycles are still rejected — any new cycle must include a formula whose path
+or expression this commit wrote, so it is always reachable from the seed.
+
+## 8. Durability defects
+
+- **A commit can ack before its WAL record is written.** Commits buffer by
+  version in `Hub::finalize`; one that CASes out of order returns success
+  and a later thread writes its record. A crash in between loses an acked
+  commit.
+- **WAL errors are swallowed** (store.rs:469-471) — `commit()` returns `Ok`
+  on a full disk. Should fail-stop: check before the CAS so a broken log
+  rejects writes instead of silently losing them.
+- **`Store::commit` spins with no backoff and no cap** (store.rs:399-410),
+  redoing all preparation each pass. `Store::transaction` already has the
+  right ladder; reuse it.
+
+## 9. Write throughput: get I/O off the critical path
+
+- **WAL fsync runs inline inside the publication mutex** (subscriptions.rs:68
+  → persistence.rs:192-201), on a tokio worker, one fsync per commit, no
+  batching. Move it to a dedicated writer thread fed by a channel, with
+  group commit. Keep the channel send *inside* the mutex so WAL order ==
+  version order still holds; only the I/O leaves. `Durability::{Sync,
+  Async, NoFsync}`, default `Sync` — concurrent writers share one fsync but
+  a commit still returns only once its own record is durable (also fixes #8).
+- **Snapshots hold the publication lock across whole-document serialize +
+  `sync_all` + rename + WAL truncate**, stalling every commit *and every new
+  subscriber connection* (`Hub::subscribe` shares the mutex) for a duration
+  proportional to document size. Take the `Arc` under the lock, enqueue a
+  WAL rotate, serialize outside; needs WAL segmentation (`wal/000001.log`,
+  keeping legacy `wal.log` readable) so old segments drop after the rename.
+- **Every write handler calls `Store::commit` from `async fn`**
+  (api.rs:199-330), and the snapshot ticker from a bare `tokio::spawn` — a
+  400ms PUT blocks a tokio worker today, before fsync is even involved.
+  `spawn_blocking` is the cheapest latency win available.
+
+Prerequisite for all of it: **we have no write-throughput measurement.**
+`examples/bench_diff.rs` is single-threaded and in-memory, so fsync never
+runs. Need stats counters (commits, CAS losses, fsyncs vs records, snapshot
+micros) and `examples/bench_write.rs` sweeping writers × durability ×
+formula count × contention.
+
+## 10. Commit rebase on CAS loss
+
+A CAS loser discards *everything* — path-copy, `reconcile`, `diff_paths`,
+formula work, `minimal_ops`, mod index — and redoes it. For a poll-style
+20k-object full replace that is ~400ms per lost race, which matters
+precisely in the mixed workload (a big periodic sync alongside small
+concurrent writes).
+
+Instead of partitioning the tree by "owner" threads: when we lose to
+exactly one commit, and our ops are `Put`/`Merge` only, and the winner's
+changed paths don't `Pointer::overlaps` any of our scan roots, and no
+formulas are implicated on either side (needs #7's query to be cheap),
+splice the already-built subtree `Arc` onto the new root via `set_at` and
+reuse the computed changed paths. Microseconds instead of a full replay.
+
+Flag-gated, off by default until a randomized test proves rebased trees
+equal full WAL replay (`nodes_equal`) — WAL replay is an independent
+implementation of the same semantics, so it makes a strong oracle. Note the
+excluded cases are load-bearing: `Append`/`Insert`/`Remove` derive array
+positions from the base root, and a winner that *adds* a formula reaching
+into our subtree must invalidate us even though its changed path doesn't
+overlap ours.

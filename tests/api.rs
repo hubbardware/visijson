@@ -7,22 +7,24 @@ use futures_util::{SinkExt, StreamExt};
 use jsondocstore::api::router;
 use jsondocstore::store::Store;
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-async fn serve() -> (String, Arc<Store>) {
+async fn serve() -> (String, Arc<Store>, Arc<Store>) {
     let store = Store::in_memory();
-    let app = router(store.clone());
+    let info = Store::in_memory();
+    let app = router(store.clone(), info.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}"), store)
+    (format!("http://{addr}"), store, info)
 }
 
 #[tokio::test]
 async fn rest_crud_roundtrip() {
-    let (base, _store) = serve().await;
+    let (base, _store, _info) = serve().await;
     let client = reqwest::Client::new();
 
     // PUT
@@ -91,7 +93,7 @@ async fn rest_crud_roundtrip() {
 
 #[tokio::test]
 async fn patch_add_replace_remove_test() {
-    let (base, _store) = serve().await;
+    let (base, _store, _info) = serve().await;
     let client = reqwest::Client::new();
     client
         .put(format!("{base}/doc"))
@@ -134,7 +136,7 @@ async fn patch_add_replace_remove_test() {
 
 #[tokio::test]
 async fn txn_endpoint_applies_atomically_with_conditions() {
-    let (base, _store) = serve().await;
+    let (base, _store, _info) = serve().await;
     let client = reqwest::Client::new();
     client
         .put(format!("{base}/doc/bal"))
@@ -163,7 +165,7 @@ async fn txn_endpoint_applies_atomically_with_conditions() {
 
 #[tokio::test]
 async fn formulas_over_rest() {
-    let (base, _store) = serve().await;
+    let (base, _store, _info) = serve().await;
     let client = reqwest::Client::new();
     client.put(format!("{base}/doc/a")).json(&json!(6)).send().await.unwrap();
     client
@@ -198,7 +200,7 @@ async fn formulas_over_rest() {
 
 #[tokio::test]
 async fn browsers_get_the_embedded_ui_api_clients_get_json() {
-    let (base, store) = serve().await;
+    let (base, store, _info) = serve().await;
     store.put("/a", json!(1)).unwrap();
     let client = reqwest::Client::new();
 
@@ -250,50 +252,83 @@ async fn browsers_get_the_embedded_ui_api_clients_get_json() {
 }
 
 #[tokio::test]
-async fn info_ticker_heartbeats() {
-    let (_base, store) = serve().await;
-    jsondocstore::api::spawn_info_ticker(store.clone(), std::time::Duration::from_millis(20));
+async fn info_ticker_heartbeats_beside_the_doc() {
+    let (base, store, info) = serve().await;
+    jsondocstore::api::spawn_info_ticker(info.clone(), std::time::Duration::from_millis(20));
 
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    let info = store.get("/info").unwrap().expect("/info should exist");
-    let time = info["time"].as_str().unwrap();
+    let v = info.get("").unwrap().expect("info root should exist");
+    let time = v["time"].as_str().unwrap();
     // RFC 3339 shape: 2026-07-28T12:34:56Z
     assert_eq!(time.len(), 20, "unexpected time format: {time}");
     assert!(time.ends_with('Z') && time.contains('T'));
     assert!(time.starts_with("20"), "implausible year in {time}");
-    assert!(info["epoch_ms"].as_u64().unwrap() > 1_700_000_000_000);
-    assert!(info["uptime_secs"].is_u64());
-    assert_eq!(info["started"].as_str().unwrap().len(), 20);
+    assert!(v["epoch_ms"].as_u64().unwrap() > 1_700_000_000_000);
+    assert!(v["uptime_secs"].is_u64());
+    assert_eq!(v["started"].as_str().unwrap().len(), 20);
 
-    // It keeps ticking: version advances and subscribers see /info changes.
-    let v1 = store.version();
-    let (_, mut rx) = store.subscribe();
+    // Served over HTTP as a sibling of /doc: GET /info/time is the probe.
+    let client = reqwest::Client::new();
+    let t: Value = client
+        .get(format!("{base}/info/time"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(t.as_str().unwrap().ends_with('Z'));
+
+    // Read-only over HTTP: writes are not routed.
+    let resp = client
+        .put(format!("{base}/info/time"))
+        .json(&json!("nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+
+    // It keeps ticking, with only genuinely changed fields reported —
+    // `started` is constant after the first tick and must never be flagged.
+    let v1 = info.version();
+    let (_, mut rx) = info.subscribe();
     let ev = rx.recv().await.unwrap();
     assert!(
-        ev.changed_paths.iter().any(|p| p.starts_with("/info")),
-        "got {:?}",
-        ev.changed_paths
-    );
-    // Only the fields that actually change are reported — `started` is
-    // constant after the first tick and must never be flagged.
-    assert!(
-        ev.changed_paths.iter().any(|p| p == "/info/time" || p == "/info/epoch_ms"),
+        ev.changed_paths.iter().any(|p| p == "/time" || p == "/epoch_ms"),
         "got {:?}",
         ev.changed_paths
     );
     assert!(
-        !ev.changed_paths.iter().any(|p| p == "/info/started" || p == "/info"),
+        !ev.changed_paths.iter().any(|p| p == "/started" || p.is_empty()),
         "unchanged fields flagged: {:?}",
         ev.changed_paths
     );
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert!(store.version() > v1, "ticker stopped advancing versions");
+    assert!(info.version() > v1, "ticker stopped advancing versions");
+
+    // The heartbeat is subscribable at /info like any document path...
+    let ws_url = format!("{}/info", base.replace("http", "ws"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let snap: Value = match ws.next().await.unwrap().unwrap() {
+        Message::Text(t) => serde_json::from_str(&t).unwrap(),
+        m => panic!("expected text, got {m:?}"),
+    };
+    assert_eq!(snap["type"], "snapshot");
+    assert!(snap["value"]["time"].is_string());
+    let change: Value = match ws.next().await.unwrap().unwrap() {
+        Message::Text(t) => serde_json::from_str(&t).unwrap(),
+        m => panic!("expected text, got {m:?}"),
+    };
+    assert_eq!(change["type"], "change");
+
+    // ...and the document store never saw any of the churn.
+    assert_eq!(store.version(), 0, "ticker leaked into the doc store");
 }
 
 #[tokio::test]
 async fn websocket_snapshot_then_ordered_filtered_changes() {
-    let (base, store) = serve().await;
-    let ws_url = format!("{}/ws?path=/watched", base.replace("http", "ws"));
+    let (base, store, _info) = serve().await;
+    let ws_url = format!("{}/doc/watched", base.replace("http", "ws"));
 
     store.put("/watched", json!({"n": 0})).unwrap();
     store.put("/ignored", json!(0)).unwrap();
@@ -306,6 +341,7 @@ async fn websocket_snapshot_then_ordered_filtered_changes() {
         m => panic!("expected text, got {m:?}"),
     };
     assert_eq!(msg["type"], "snapshot");
+    assert_eq!(msg["exists"], json!(true));
     assert_eq!(msg["value"], json!({"n": 0}));
     let snap_version = msg["version"].as_u64().unwrap();
 
@@ -347,12 +383,12 @@ async fn websocket_snapshot_then_ordered_filtered_changes() {
 
 #[tokio::test]
 async fn websocket_subscribers_watching_different_paths() {
-    let (base, store) = serve().await;
+    let (base, store, _info) = serve().await;
     store.put("/a", json!(0)).unwrap();
     store.put("/b", json!(0)).unwrap();
 
     let ws = |p: &str| {
-        let url = format!("{}/ws?path={}", base.replace("http", "ws"), p);
+        let url = format!("{}/doc{}", base.replace("http", "ws"), p);
         async move { tokio_tungstenite::connect_async(url).await.unwrap().0 }
     };
     let mut ws_a = ws("/a").await;
@@ -384,9 +420,9 @@ async fn websocket_subscribers_watching_different_paths() {
 
 #[tokio::test]
 async fn websocket_json_patch_add_and_remove_ops() {
-    let (base, store) = serve().await;
+    let (base, store, _info) = serve().await;
     store.put("/w", json!({"keep": 1, "gone": 2})).unwrap();
-    let ws_url = format!("{}/ws?path=/w", base.replace("http", "ws"));
+    let ws_url = format!("{}/doc/w", base.replace("http", "ws"));
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws.next().await; // snapshot
 
@@ -409,12 +445,20 @@ async fn websocket_json_patch_add_and_remove_ops() {
 
 #[tokio::test]
 async fn websocket_merge_patch_format() {
-    let (base, store) = serve().await;
+    let (base, store, _info) = serve().await;
     store
         .put("/w", json!({"a": 1, "b": {"x": 1, "y": 2}, "gone": true}))
         .unwrap();
-    let ws_url = format!("{}/ws?path=/w&format=merge-patch", base.replace("http", "ws"));
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let ws_url = format!("{}/doc/w", base.replace("http", "ws"));
+    let mut req = ws_url.clone().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("sec-websocket-protocol", "merge-patch".parse().unwrap());
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    // The handshake echoes the selected subprotocol.
+    assert_eq!(
+        resp.headers()["sec-websocket-protocol"].to_str().unwrap(),
+        "merge-patch"
+    );
     ws.next().await; // snapshot
 
     // One commit touching a nested field, deleting a key, and leaving the
@@ -427,14 +471,259 @@ async fn websocket_merge_patch_format() {
     assert_eq!(v["type"], "change");
     assert_eq!(v["merge"], json!({"b": {"x": 9}, "gone": null}));
 
-    // Unknown format is rejected before upgrade.
-    let bad = format!("{}/ws?path=/w&format=bogus", base.replace("http", "ws"));
-    assert!(tokio_tungstenite::connect_async(&bad).await.is_err());
+    // Offering only unknown subprotocols is rejected before upgrade.
+    let mut bad = ws_url.into_client_request().unwrap();
+    bad.headers_mut()
+        .insert("sec-websocket-protocol", "bogus".parse().unwrap());
+    assert!(tokio_tungstenite::connect_async(bad).await.is_err());
+}
+
+/// Pull the next real SSE event (id + JSON data) off a streaming response,
+/// skipping keep-alive comment frames.
+async fn next_sse(resp: &mut reqwest::Response, buf: &mut String) -> (u64, Value) {
+    loop {
+        if let Some(pos) = buf.find("\n\n") {
+            let frame = buf[..pos].to_string();
+            buf.replace_range(..pos + 2, "");
+            let mut id = None;
+            let mut data = None;
+            for line in frame.lines() {
+                if let Some(v) = line.strip_prefix("id:") {
+                    id = Some(v.trim().parse::<u64>().unwrap());
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data = Some(serde_json::from_str::<Value>(v.trim()).unwrap());
+                }
+            }
+            if let (Some(i), Some(d)) = (id, data) {
+                return (i, d);
+            }
+            continue; // comment-only keep-alive frame
+        }
+        let chunk = resp.chunk().await.unwrap().expect("SSE stream ended");
+        buf.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn sse_snapshot_then_filtered_changes() {
+    let (base, store, _info) = serve().await;
+    store.put("/w", json!({"n": 0})).unwrap();
+    store.put("/ignored", json!(0)).unwrap();
+
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+
+    let mut buf = String::new();
+    let (snap_id, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(snap["value"], json!({"n": 0}));
+    assert_eq!(snap_id, snap["version"].as_u64().unwrap());
+
+    store.put("/ignored", json!(1)).unwrap(); // must NOT be delivered
+    store.put("/w/n", json!(1)).unwrap();
+    store.put("/w/n", json!(2)).unwrap();
+
+    let (id1, ev1) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(ev1["patch"], json!([{"op": "replace", "path": "/n", "value": 1}]));
+    assert!(id1 > snap_id);
+    let (id2, ev2) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(ev2["patch"], json!([{"op": "replace", "path": "/n", "value": 2}]));
+    assert!(id2 > id1);
+}
+
+#[tokio::test]
+async fn conditional_gets_with_etag_and_if_modified_since() {
+    let (base, store, _info) = serve().await;
+    store.put("/a", json!({"n": 1})).unwrap();
+    store.put("/b", json!({"n": 1})).unwrap();
+    let client = reqwest::Client::new();
+
+    // A read carries validators.
+    let resp = client.get(format!("{base}/doc/a")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+    let last_mod = resp.headers()["last-modified"].to_str().unwrap().to_string();
+    assert_eq!(resp.headers()["cache-control"], "no-cache");
+    assert!(last_mod.ends_with(" GMT"), "got {last_mod}");
+
+    // Re-reading with that ETag → 304, no body.
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 304);
+    assert_eq!(resp.headers()["etag"], etag.as_str());
+    assert!(resp.text().await.unwrap().is_empty());
+
+    // Weak comparison: W/"x" matches "x".
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-none-match", format!("W/{etag}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 304);
+
+    // A write to an unrelated path must NOT invalidate /a.
+    store.put("/b/n", json!(2)).unwrap();
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 304, "sibling write invalidated /a");
+
+    // Writing inside /a does invalidate it, with a new ETag.
+    store.put("/a/n", json!(2)).unwrap();
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let etag2 = resp.headers()["etag"].to_str().unwrap().to_string();
+    assert_ne!(etag2, etag);
+
+    // ?raw=true is a different representation, so a different ETag.
+    let resp = client
+        .get(format!("{base}/doc/a?raw=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.headers()["etag"].to_str().unwrap(), etag2);
+    // ...and the plain ETag must not satisfy a raw request.
+    let resp = client
+        .get(format!("{base}/doc/a?raw=true"))
+        .header("if-none-match", &etag2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // If-Modified-Since, using the date the server itself reported.
+    let resp = client.get(format!("{base}/doc/a")).send().await.unwrap();
+    let last_mod = resp.headers()["last-modified"].to_str().unwrap().to_string();
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-modified-since", &last_mod)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 304);
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-modified-since", "Sun, 06 Nov 1994 08:49:37 GMT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // An unparseable date is ignored rather than trusted.
+    let resp = client
+        .get(format!("{base}/doc/a"))
+        .header("if-modified-since", "not a date")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A missing path is a 404, never a 304.
+    let resp = client
+        .get(format!("{base}/doc/gone"))
+        .header("if-none-match", "*")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn snapshot_distinguishes_absent_from_null() {
+    let (base, store, _info) = serve().await;
+    let client = reqwest::Client::new();
+
+    // A plain GET of a missing path is still a 404 …
+    let resp = client.get(format!("{base}/doc/nothing")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // … but a subscription succeeds and says so explicitly.
+    let mut resp = client
+        .get(format!("{base}/doc/nothing"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let mut buf = String::new();
+    let (_, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(snap["exists"], json!(false));
+    assert_eq!(snap["value"], json!(null));
+
+    // Watch-then-create: the birth of the path arrives as an add.
+    store.put("/nothing", json!({"a": 1})).unwrap();
+    let (_, ev) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(ev["patch"], json!([{"op": "add", "path": "", "value": {"a": 1}}]));
+
+    // A path explicitly set to JSON null exists.
+    store.put("/reallynull", json!(null)).unwrap();
+    let mut resp = client
+        .get(format!("{base}/doc/reallynull"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let mut buf = String::new();
+    let (_, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(snap["exists"], json!(true));
+    assert_eq!(snap["value"], json!(null));
+}
+
+#[tokio::test]
+async fn sse_merge_patch_via_accept_parameter() {
+    let (base, store, _info) = serve().await;
+    store.put("/w", json!({"a": 1, "gone": true})).unwrap();
+    let client = reqwest::Client::new();
+
+    let mut resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream;patch=merge-patch")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut buf = String::new();
+    let (_, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(snap["type"], "snapshot");
+
+    store.put("/w", json!({"a": 2})).unwrap();
+    let (_, ev) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(ev["merge"], json!({"a": 2, "gone": null}));
+
+    // Unknown patch parameter → 400 before any stream starts.
+    let resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream;patch=bogus")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }
 
 #[tokio::test]
 async fn rest_merge_patch() {
-    let (base, _store) = serve().await;
+    let (base, _store, _info) = serve().await;
     let client = reqwest::Client::new();
     client
         .put(format!("{base}/doc/users"))

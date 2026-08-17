@@ -45,18 +45,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Liveness heartbeat at /info, once per second by default (0 disables).
+    // Liveness heartbeat at /info — its own in-memory store, a sibling of
+    // /doc, so the churn never reaches document subscribers or the WAL.
+    // Once per second by default (0 disables).
+    let info = Store::in_memory();
     let info_tick_secs: u64 = std::env::var("INFO_TICK_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     if info_tick_secs > 0 {
-        api::spawn_info_ticker(store.clone(), Duration::from_secs(info_tick_secs));
+        api::spawn_info_ticker(info.clone(), Duration::from_secs(info_tick_secs));
     }
 
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "listening");
-    axum::serve(listener, api::router(store)).await?;
+    axum::serve(listener, api::router(store, info)).await?;
     Ok(())
 }

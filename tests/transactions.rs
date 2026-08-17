@@ -104,7 +104,7 @@ fn conditions_guard_commits() {
         .commit(
             vec![Op::Put {
                 path: "/state".into(),
-                value: json!("published"),
+                value: jsondocstore::model::from_value(&json!("published")),
             }],
             &[Condition {
                 path: "/state".into(),
@@ -119,7 +119,7 @@ fn conditions_guard_commits() {
         .commit(
             vec![Op::Put {
                 path: "/state".into(),
-                value: json!("archived"),
+                value: jsondocstore::model::from_value(&json!("archived")),
             }],
             &[Condition {
                 path: "/state".into(),
@@ -135,7 +135,7 @@ fn conditions_guard_commits() {
         .commit(
             vec![Op::Put {
                 path: "/state".into(),
-                value: json!("x"),
+                value: jsondocstore::model::from_value(&json!("x")),
             }],
             &[Condition {
                 path: "/state".into(),

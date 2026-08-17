@@ -277,10 +277,11 @@
 const $ = (s) => document.querySelector(s);
 
 // ------------------------------------------------ pointer helpers
-// The page is served at /doc or /doc/<segments>; derive the JSON pointer.
+// The page is served at /<ns> or /<ns>/<segments> where ns is a top-level
+// namespace (doc, info, ...); derive the namespace and JSON pointer.
+const ns = "/" + (location.pathname.split("/")[1] || "doc");
 function pointerFromLocation() {
-  let p = location.pathname;
-  if (p.startsWith("/doc")) p = p.slice(4);
+  let p = location.pathname.slice(ns.length);
   if (p === "" || p === "/") return "";
   return p.split("/").map(decodeURIComponent).join("/");
 }
@@ -292,7 +293,7 @@ function escapeToken(t) {
   return String(t).replace(/~/g, "~0").replace(/\//g, "~1");
 }
 function docHref(toks) {
-  return "/doc" + toks.map((t) => "/" + encodeURIComponent(escapeToken(t))).join("");
+  return ns + toks.map((t) => "/" + encodeURIComponent(escapeToken(t))).join("");
 }
 function docUrl(pointer) {
   return docHref(tokens(pointer));
@@ -316,7 +317,7 @@ function renderCrumbs() {
   el.innerHTML = "";
   const toks = tokens(state.pointer);
   const rootLink = document.createElement("a");
-  rootLink.href = "/doc";
+  rootLink.href = ns;
   rootLink.textContent = "⌂";
   el.appendChild(rootLink);
   toks.forEach((t, i) => {
@@ -630,8 +631,10 @@ function applyPatch(ops) {
   }
 }
 function connect() {
+  // Subscribe by upgrading the document's own URL; the subprotocol picks
+  // the event format.
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(proto + "://" + location.host + "/ws?path=" + encodeURIComponent(state.pointer));
+  const ws = new WebSocket(proto + "://" + location.host + docUrl(state.pointer), "json-patch");
   ws.onopen = () => {
     setConnected(true);
     state.reconnectDelay = 400;

@@ -55,12 +55,15 @@ fn put_records_only_genuinely_changed_paths() {
         .unwrap();
     assert_eq!(info.changed_paths, vec!["/info/time", "/info/uptime"]);
 
-    // Fully identical rewrite → nothing changed (version still advances).
+    // Fully identical rewrite → the commit is elided entirely: no changed
+    // paths and no version bump.
+    let v_before = store.version();
     let info = store
         .put("/info", json!({"time": "t2", "uptime": 2, "started": "t0"}))
         .unwrap();
     assert!(info.changed_paths.is_empty(), "got {:?}", info.changed_paths);
-    assert_eq!(info.version, 3);
+    assert_eq!(info.version, v_before);
+    assert_eq!(store.version(), v_before);
 
     // Added and removed keys are each reported.
     let info = store
@@ -91,7 +94,7 @@ fn array_insert_and_remove_report_the_whole_array() {
         .commit(
             vec![Op::Insert {
                 path: "/l/1".into(),
-                value: json!(9),
+                value: jsondocstore::model::from_value(&json!(9)),
             }],
             &[],
         )
@@ -211,4 +214,26 @@ fn old_snapshots_remain_readable_after_new_commits() {
     let node = jsondocstore::model::get_at(&old.root, &ptr).unwrap();
     assert_eq!(jsondocstore::model::to_plain_value(&node), json!(1));
     assert_eq!(store.get("/v").unwrap(), Some(json!(2)));
+}
+
+#[test]
+fn full_replace_reconciles_structural_sharing() {
+    use jsondocstore::store::shares_subtree;
+    let store = Store::in_memory();
+    store
+        .put("/things", json!({"t1": {"v": 1}, "t2": {"v": 2}, "t3": {"v": 3}}))
+        .unwrap();
+    let before = store.head();
+
+    // Re-PUT the whole collection (poll-style) with one entry changed: the
+    // untouched entries must keep their old Arcs, and the diff must report
+    // only the real change.
+    let info = store
+        .put("/things", json!({"t1": {"v": 1}, "t2": {"v": 99}, "t3": {"v": 3}}))
+        .unwrap();
+    assert_eq!(info.changed_paths, vec!["/things/t2/v"]);
+    let after = store.head();
+    assert!(shares_subtree(&before, &after, "/things/t1"));
+    assert!(shares_subtree(&before, &after, "/things/t3"));
+    assert!(!shares_subtree(&before, &after, "/things/t2"));
 }

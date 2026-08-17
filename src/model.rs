@@ -2,10 +2,12 @@
 //! produce a new root by copying only the nodes along the written path
 //! (path-copy), sharing every untouched subtree with the previous version.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
+use imbl::OrdMap;
+use serde::{Deserialize as _, Serialize as _};
 use serde_json::{Map, Number, Value};
 
 use crate::error::{Result, StoreError};
@@ -22,7 +24,10 @@ pub enum Node {
     Number(Number),
     String(String),
     Array(Vec<Arc<Node>>),
-    Object(BTreeMap<String, Arc<Node>>),
+    // A persistent sorted map: `clone()` is O(1) and mutation path-copies
+    // O(log n) tree nodes, so path-copy writes into huge objects stay cheap
+    // while iteration remains ordered by key (the diff walks rely on that).
+    Object(OrdMap<String, Arc<Node>>),
     Formula(FormulaNode),
 }
 
@@ -34,7 +39,7 @@ pub struct FormulaNode {
 }
 
 pub fn empty_object() -> Arc<Node> {
-    Arc::new(Node::Object(BTreeMap::new()))
+    Arc::new(Node::Object(OrdMap::new()))
 }
 
 /// Build a node tree from a JSON value. Objects of the shape
@@ -61,6 +66,160 @@ pub fn from_value(v: &Value) -> Arc<Node> {
                 map.iter().map(|(k, v)| (k.clone(), from_value(v))).collect(),
             ))
         }
+    }
+}
+
+/// `Node` serializes in **raw** form (formulas as `{"$formula", "$value"}`)
+/// — byte-identical to serializing `to_raw_value`, without building a
+/// `Value`. Used for the WAL, snapshots, and `?raw=true` responses.
+impl serde::Serialize for Node {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Node::Null => s.serialize_unit(),
+            Node::Bool(b) => s.serialize_bool(*b),
+            Node::Number(n) => n.serialize(s),
+            Node::String(v) => s.serialize_str(v),
+            Node::Array(items) => {
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&**item)?;
+                }
+                seq.end()
+            }
+            Node::Object(map) => {
+                let mut m = s.serialize_map(Some(map.len()))?;
+                for (k, v) in map {
+                    m.serialize_entry(k, &**v)?;
+                }
+                m.end()
+            }
+            Node::Formula(f) => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry(FORMULA_KEY, &f.expr)?;
+                m.serialize_entry(FORMULA_VALUE_KEY, &*f.cached)?;
+                m.end()
+            }
+        }
+    }
+}
+
+/// Deserialize JSON straight into a `Node` tree — no intermediate
+/// `serde_json::Value`. Objects shaped `{"$formula": "..."}` become formula
+/// nodes, mirroring `from_value`.
+impl<'de> serde::Deserialize<'de> for Node {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Node, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Node;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<Node, E> {
+                Ok(Node::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Node, E> {
+                Ok(Node::Number(Number::from(v)))
+            }
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Node, E> {
+                Ok(Node::Number(Number::from(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Node, E> {
+                Number::from_f64(v)
+                    .map(Node::Number)
+                    .ok_or_else(|| E::custom("non-finite number"))
+            }
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Node, E> {
+                Ok(Node::String(v.to_owned()))
+            }
+            fn visit_string<E>(self, v: String) -> std::result::Result<Node, E> {
+                Ok(Node::String(v))
+            }
+            fn visit_unit<E>(self) -> std::result::Result<Node, E> {
+                Ok(Node::Null)
+            }
+            fn visit_none<E>(self) -> std::result::Result<Node, E> {
+                Ok(Node::Null)
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                d: D,
+            ) -> std::result::Result<Node, D::Error> {
+                Node::deserialize(d)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Node, A::Error> {
+                let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(n) = seq.next_element::<Node>()? {
+                    items.push(Arc::new(n));
+                }
+                Ok(Node::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> std::result::Result<Node, A::Error> {
+                let mut map = OrdMap::new();
+                while let Some((k, v)) = access.next_entry::<String, Node>()? {
+                    map.insert(k, Arc::new(v));
+                }
+                if let Some(expr) = map.get(FORMULA_KEY).and_then(|n| match &**n {
+                    Node::String(s) => Some(s.clone()),
+                    _ => None,
+                }) {
+                    let cached = map
+                        .get(FORMULA_VALUE_KEY)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Node::Null));
+                    return Ok(Node::Formula(FormulaNode { expr, cached }));
+                }
+                Ok(Node::Object(map))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Serialize an `Arc<Node>` in **plain** form: formulas replaced by their
+/// cached values — what readers see. The streaming twin of `to_plain_value`.
+pub struct PlainView(pub Arc<Node>);
+
+impl serde::Serialize for PlainView {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        plain_serialize(&self.0, s)
+    }
+}
+
+fn plain_serialize<S: serde::Serializer>(
+    node: &Node,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::{SerializeMap, SerializeSeq};
+    struct P<'a>(&'a Node);
+    impl serde::Serialize for P<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+            plain_serialize(self.0, s)
+        }
+    }
+    match node {
+        Node::Formula(f) => plain_serialize(&f.cached, s),
+        Node::Array(items) => {
+            let mut seq = s.serialize_seq(Some(items.len()))?;
+            for item in items {
+                seq.serialize_element(&P(item))?;
+            }
+            seq.end()
+        }
+        Node::Object(map) => {
+            let mut m = s.serialize_map(Some(map.len()))?;
+            for (k, v) in map {
+                m.serialize_entry(k, &P(v))?;
+            }
+            m.end()
+        }
+        other => other.serialize(s),
     }
 }
 
@@ -105,7 +264,149 @@ pub fn to_plain_value(node: &Node) -> Value {
 }
 
 pub fn nodes_equal(a: &Arc<Node>, b: &Arc<Node>) -> bool {
-    Arc::ptr_eq(a, b) || to_raw_value(a) == to_raw_value(b)
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    match (&**a, &**b) {
+        (Node::Null, Node::Null) => true,
+        (Node::Bool(x), Node::Bool(y)) => x == y,
+        (Node::Number(x), Node::Number(y)) => x == y,
+        (Node::String(x), Node::String(y)) => x == y,
+        (Node::Array(x), Node::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| nodes_equal(a, b))
+        }
+        // Map iteration is sorted, so equal-length maps compare by a
+        // single lockstep walk — and shared subtrees exit via ptr_eq above.
+        (Node::Object(x), Node::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((ka, va), (kb, vb))| ka == kb && nodes_equal(va, vb))
+        }
+        (Node::Formula(x), Node::Formula(y)) => {
+            x.expr == y.expr && nodes_equal(&x.cached, &y.cached)
+        }
+        _ => false,
+    }
+}
+
+/// One step of a lockstep walk over two sorted key spaces.
+pub enum MergeSide<'a> {
+    /// Key only in the old/left map.
+    Left(&'a String, &'a Arc<Node>),
+    /// Key only in the new/right map.
+    Right(&'a String, &'a Arc<Node>),
+    /// Key in both.
+    Both(&'a String, &'a Arc<Node>, &'a Arc<Node>),
+}
+
+/// Walk two object maps in lockstep. `OrdMap` iteration is ascending by
+/// key, so one linear merge pass classifies every key as removed, added,
+/// or shared — no per-key lookups.
+fn merge_walk<'a>(
+    a: &'a OrdMap<String, Arc<Node>>,
+    b: &'a OrdMap<String, Arc<Node>>,
+    mut f: impl FnMut(MergeSide<'a>),
+) {
+    let mut ia = a.iter().peekable();
+    let mut ib = b.iter().peekable();
+    loop {
+        match (ia.peek(), ib.peek()) {
+            (Some(&(ka, _)), Some(&(kb, _))) => match ka.cmp(kb) {
+                std::cmp::Ordering::Less => {
+                    let (k, v) = ia.next().unwrap();
+                    f(MergeSide::Left(k, v));
+                }
+                std::cmp::Ordering::Greater => {
+                    let (k, v) = ib.next().unwrap();
+                    f(MergeSide::Right(k, v));
+                }
+                std::cmp::Ordering::Equal => {
+                    let (k, va) = ia.next().unwrap();
+                    let (_, vb) = ib.next().unwrap();
+                    f(MergeSide::Both(k, va, vb));
+                }
+            },
+            (Some(_), None) => {
+                let (k, v) = ia.next().unwrap();
+                f(MergeSide::Left(k, v));
+            }
+            (None, Some(_)) => {
+                let (k, v) = ib.next().unwrap();
+                f(MergeSide::Right(k, v));
+            }
+            (None, None) => break,
+        }
+    }
+}
+
+/// Rebuild `new` reusing subtrees of `old` wherever they are equal, so a
+/// full-subtree replacement (poll a source, PUT the whole list) restores
+/// structural sharing with the previous version instead of keeping two
+/// copies. Returns `old`'s own Arc when nothing changed at all — downstream
+/// `Arc::ptr_eq` checks (diffs, equality, event encoding) then short-circuit
+/// exactly as if only the changed entries had been written.
+pub fn reconcile(old: &Arc<Node>, new: &Arc<Node>) -> Arc<Node> {
+    if Arc::ptr_eq(old, new) {
+        return old.clone();
+    }
+    match (&**old, &**new) {
+        (Node::Object(a), Node::Object(b)) => {
+            let mut out = OrdMap::new();
+            let mut all_old = a.len() == b.len();
+            merge_walk(a, b, |side| match side {
+                MergeSide::Left(_, _) => all_old = false,
+                MergeSide::Right(k, vb) => {
+                    all_old = false;
+                    out.insert(k.clone(), vb.clone());
+                }
+                MergeSide::Both(k, va, vb) => {
+                    let r = reconcile(va, vb);
+                    if !Arc::ptr_eq(&r, va) {
+                        all_old = false;
+                    }
+                    out.insert(k.clone(), r);
+                }
+            });
+            if all_old {
+                old.clone()
+            } else {
+                Arc::new(Node::Object(out))
+            }
+        }
+        (Node::Array(a), Node::Array(b)) => {
+            let mut all_old = a.len() == b.len();
+            let out: Vec<Arc<Node>> = b
+                .iter()
+                .enumerate()
+                .map(|(i, vb)| match a.get(i) {
+                    Some(va) => {
+                        let r = reconcile(va, vb);
+                        if !Arc::ptr_eq(&r, va) {
+                            all_old = false;
+                        }
+                        r
+                    }
+                    None => {
+                        all_old = false;
+                        vb.clone()
+                    }
+                })
+                .collect();
+            if all_old {
+                old.clone()
+            } else {
+                Arc::new(Node::Array(out))
+            }
+        }
+        _ => {
+            if nodes_equal(old, new) {
+                old.clone()
+            } else {
+                new.clone()
+            }
+        }
+    }
 }
 
 /// A parsed RFC 6901 JSON pointer. The empty string addresses the root.
@@ -284,7 +585,7 @@ fn set_rec(
         }
         Node::Null => {
             let child = set_rec(&Arc::new(Node::Null), &toks[1..], new, full, insert)?;
-            let mut m = BTreeMap::new();
+            let mut m = OrdMap::new();
             m.insert(tok.clone(), child);
             Ok(Arc::new(Node::Object(m)))
         }
@@ -360,17 +661,10 @@ pub fn diff_paths(old: &Arc<Node>, new: &Arc<Node>, base: &Pointer, out: &mut Ve
         (Node::Number(a), Node::Number(b)) if a == b => {}
         (Node::String(a), Node::String(b)) if a == b => {}
         (Node::Object(a), Node::Object(b)) => {
-            for (k, vb) in b {
-                match a.get(k) {
-                    Some(va) => diff_paths(va, vb, &base.push(k.clone()), out),
-                    None => out.push(base.push(k.clone())),
-                }
-            }
-            for k in a.keys() {
-                if !b.contains_key(k) {
-                    out.push(base.push(k.clone()));
-                }
-            }
+            merge_walk(a, b, |side| match side {
+                MergeSide::Left(k, _) | MergeSide::Right(k, _) => out.push(base.push(k.clone())),
+                MergeSide::Both(k, va, vb) => diff_paths(va, vb, &base.push(k.clone()), out),
+            });
         }
         (Node::Array(a), Node::Array(b)) if a.len() == b.len() => {
             for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
@@ -388,27 +682,26 @@ pub fn diff_paths(old: &Arc<Node>, new: &Arc<Node>, base: &Pointer, out: &mut Ve
 
 /// Apply an RFC 7396 JSON Merge Patch to `target`, returning the merged
 /// node. Object members merge recursively (null members delete); anything
-/// else — including `{"$formula": ...}` literals — replaces wholesale.
-pub fn merge_value(target: Option<&Arc<Node>>, patch: &Value) -> Arc<Node> {
-    if let Value::Object(map) = patch {
-        if let Some(Value::String(_)) = map.get(FORMULA_KEY) {
-            return from_value(patch); // formula literal is a leaf
-        }
-        let mut out = match target.map(|t| &**t) {
-            Some(Node::Object(m)) => m.clone(),
-            _ => BTreeMap::new(),
-        };
-        for (k, v) in map {
-            if v.is_null() {
-                out.remove(k.as_str());
-            } else {
-                let merged = merge_value(out.get(k.as_str()), v);
-                out.insert(k.clone(), merged);
+/// else — including formula nodes, which are leaves — replaces wholesale.
+pub fn merge_value(target: Option<&Arc<Node>>, patch: &Arc<Node>) -> Arc<Node> {
+    match &**patch {
+        Node::Object(pm) => {
+            let mut out = match target.map(|t| &**t) {
+                Some(Node::Object(m)) => m.clone(),
+                _ => OrdMap::new(),
+            };
+            for (k, v) in pm {
+                if matches!(&**v, Node::Null) {
+                    out.remove(k.as_str());
+                } else {
+                    let merged = merge_value(out.get(k.as_str()), v);
+                    out.insert(k.clone(), merged);
+                }
             }
+            Arc::new(Node::Object(out))
         }
-        return Arc::new(Node::Object(out));
+        _ => patch.clone(),
     }
-    from_value(patch)
 }
 
 /// Produce the minimal RFC 7396 merge patch that turns `old` into `new`
@@ -427,16 +720,19 @@ pub fn merge_patch_diff(old: Option<&Arc<Node>>, new: Option<&Arc<Node>>) -> Opt
             match (&**o, &**n) {
                 (Node::Object(a), Node::Object(b)) => {
                     let mut m = Map::new();
-                    for (k, vb) in b {
-                        if let Some(d) = merge_patch_diff(a.get(k), Some(vb)) {
-                            m.insert(k.clone(), d);
-                        }
-                    }
-                    for k in a.keys() {
-                        if !b.contains_key(k) {
+                    merge_walk(a, b, |side| match side {
+                        MergeSide::Left(k, _) => {
                             m.insert(k.clone(), Value::Null);
                         }
-                    }
+                        MergeSide::Right(k, vb) => {
+                            m.insert(k.clone(), to_plain_value(vb));
+                        }
+                        MergeSide::Both(k, va, vb) => {
+                            if let Some(d) = merge_patch_diff(Some(va), Some(vb)) {
+                                m.insert(k.clone(), d);
+                            }
+                        }
+                    });
                     if m.is_empty() {
                         None
                     } else {
@@ -457,23 +753,33 @@ pub fn merge_patch_diff(old: Option<&Arc<Node>>, new: Option<&Arc<Node>>) -> Opt
 }
 
 /// Visit every node in the tree (skipping formula cached values, which are
-/// derived data) with its pointer path.
-pub fn walk(root: &Arc<Node>, mut visit: impl FnMut(&Pointer, &Arc<Node>)) {
-    fn rec(node: &Arc<Node>, path: &Pointer, visit: &mut impl FnMut(&Pointer, &Arc<Node>)) {
+/// derived data). The path arrives as a token stack — borrowed object keys,
+/// owned array indices — so the traversal allocates nothing per node;
+/// materialize a `Pointer` only for the nodes you actually care about.
+pub fn walk<'a>(root: &'a Arc<Node>, mut visit: impl FnMut(&[Cow<'a, str>], &'a Arc<Node>)) {
+    fn rec<'a>(
+        node: &'a Arc<Node>,
+        path: &mut Vec<Cow<'a, str>>,
+        visit: &mut impl FnMut(&[Cow<'a, str>], &'a Arc<Node>),
+    ) {
         visit(path, node);
         match &**node {
             Node::Object(map) => {
                 for (k, v) in map {
-                    rec(v, &path.push(k.clone()), visit);
+                    path.push(Cow::Borrowed(k.as_str()));
+                    rec(v, path, visit);
+                    path.pop();
                 }
             }
             Node::Array(items) => {
                 for (i, v) in items.iter().enumerate() {
-                    rec(v, &path.push(i.to_string()), visit);
+                    path.push(Cow::Owned(i.to_string()));
+                    rec(v, path, visit);
+                    path.pop();
                 }
             }
             _ => {}
         }
     }
-    rec(root, &Pointer::root(), &mut visit);
+    rec(root, &mut Vec::new(), &mut visit);
 }

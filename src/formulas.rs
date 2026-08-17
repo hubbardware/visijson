@@ -3,12 +3,21 @@
 //! Grammar:
 //!   expr   := term (('+' | '-') term)*
 //!   term   := factor (('*' | '/') factor)*
-//!   factor := number | pointer | '-' factor | '(' expr ')' | ident '(' args ')'
+//!   factor := number | string | pointer | '-' factor | '(' expr ')' | ident '(' args ')'
 //!   args   := expr (',' expr)*
 //!
-//! Pointers (`/a/b`) reference other document paths. Functions: sum, count,
-//! min, max (each accepts scalars and arrays). A bare pointer expression
-//! yields the referenced value verbatim (any JSON type).
+//! Pointers (`/a/b`) reference other document paths. Strings are single- or
+//! double-quoted with `\` escapes. Functions: sum, count, min, max (each
+//! accepts scalars and arrays). A bare pointer expression yields the
+//! referenced value verbatim (any JSON type).
+//!
+//! Query engines are ordinary functions of the form `engine(scope, 'program')`:
+//! `jq(/players, '[.[] | .name]')` runs a jq program (via jaq) against the
+//! plain value of the subtree at `/players`. The scope pointer doubles as the
+//! formula's dependency, so re-evaluation and cycle detection need no insight
+//! into the program text. The program must produce exactly one value — wrap
+//! stream outputs in `[...]`. Other engines can slot in as sibling functions
+//! later (`jmes(...)` is reserved for JMESPath).
 //!
 //! On every commit, formulas whose dependencies overlap the changed paths are
 //! re-evaluated in topological order; cycles reject the commit.
@@ -26,6 +35,7 @@ use crate::model::{
 #[derive(Debug, Clone)]
 pub enum Expr {
     Num(f64),
+    Str(String),
     Ref(Pointer),
     Neg(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -45,6 +55,7 @@ pub enum BinOp {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Num(f64),
+    Str(String),
     Ptr(String),
     Ident(String),
     Plus,
@@ -101,9 +112,36 @@ fn lex(expr: &str) -> std::result::Result<Vec<Tok>, String> {
                 prev_is_value = false;
                 i += 1;
             }
+            '\'' | '"' => {
+                let quote = c;
+                i += 1;
+                let mut s = String::new();
+                loop {
+                    match chars.get(i) {
+                        None => return Err("unterminated string".into()),
+                        Some('\\') => {
+                            match chars.get(i + 1) {
+                                Some(&e) => s.push(e),
+                                None => return Err("unterminated string".into()),
+                            }
+                            i += 2;
+                        }
+                        Some(&e) if e == quote => {
+                            i += 1;
+                            break;
+                        }
+                        Some(&e) => {
+                            s.push(e);
+                            i += 1;
+                        }
+                    }
+                }
+                toks.push(Tok::Str(s));
+                prev_is_value = true;
+            }
             '/' => {
                 let start = i;
-                while i < chars.len() && !" \t\n\r+-*(),".contains(chars[i]) {
+                while i < chars.len() && !" \t\n\r+-*(),'\"".contains(chars[i]) {
                     i += 1;
                 }
                 let ptr: String = chars[start..i].iter().collect();
@@ -188,6 +226,7 @@ impl Parser {
     fn factor(&mut self) -> std::result::Result<Expr, String> {
         match self.next() {
             Some(Tok::Num(n)) => Ok(Expr::Num(n)),
+            Some(Tok::Str(s)) => Ok(Expr::Str(s)),
             Some(Tok::Ptr(p)) => {
                 let ptr = Pointer::parse(&p).map_err(|e| e.to_string())?;
                 Ok(Expr::Ref(ptr))
@@ -246,7 +285,7 @@ pub fn dependencies(ast: &Expr) -> Vec<Pointer> {
     let mut deps = Vec::new();
     fn rec(e: &Expr, out: &mut Vec<Pointer>) {
         match e {
-            Expr::Num(_) => {}
+            Expr::Num(_) | Expr::Str(_) => {}
             Expr::Ref(p) => out.push(p.clone()),
             Expr::Neg(a) => rec(a, out),
             Expr::Bin(_, a, b) => {
@@ -269,6 +308,7 @@ pub fn dependencies(ast: &Expr) -> Vec<Pointer> {
 fn eval(ast: &Expr, root: &Arc<Node>) -> std::result::Result<Value, String> {
     match ast {
         Expr::Num(n) => num_to_value(*n),
+        Expr::Str(s) => Ok(Value::String(s.clone())),
         Expr::Ref(p) => {
             let node = get_at(root, p).ok_or_else(|| format!("missing reference {p}"))?;
             Ok(to_plain_value(&node))
@@ -290,6 +330,19 @@ fn eval(ast: &Expr, root: &Arc<Node>) -> std::result::Result<Value, String> {
             num_to_value(r)
         }
         Expr::Call(name, args) => {
+            // Query engines: engine(scope, 'program'). Dispatched before the
+            // numeric functions since their arguments aren't numbers.
+            if name == "jq" {
+                if args.len() != 2 {
+                    return Err("jq() takes (scope, 'program')".into());
+                }
+                let input = eval(&args[0], root)?;
+                let program = match eval(&args[1], root)? {
+                    Value::String(s) => s,
+                    other => return Err(format!("jq() program must be a string, got {other}")),
+                };
+                return eval_jq(&program, input);
+            }
             let mut nums = Vec::new();
             for a in args {
                 collect_nums(a, root, &mut nums)?;
@@ -311,6 +364,53 @@ fn eval(ast: &Expr, root: &Arc<Node>) -> std::result::Result<Value, String> {
             }
         }
     }
+}
+
+/// Run a jq program (via jaq) against `input`. The program must produce
+/// exactly one value; streams should be collected with `[...]`.
+fn eval_jq(program: &str, input: Value) -> std::result::Result<Value, String> {
+    use jaq_core::load::{Arena, File, Loader};
+    use jaq_core::{Compiler, Ctx, RcIter};
+    use jaq_json::Val;
+
+    let file = File {
+        code: program,
+        path: (),
+    };
+    let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs()));
+    let arena = Arena::default();
+    let modules = loader
+        .load(&arena, file)
+        .map_err(|errs| format!("jq parse: {}", load_errors(errs)))?;
+    let filter = Compiler::default()
+        .with_funs(jaq_std::funs().chain(jaq_json::funs()))
+        .compile(modules)
+        .map_err(|errs| format!("jq compile: {}", compile_errors(errs)))?;
+    let inputs = RcIter::new(core::iter::empty());
+    let mut out = filter.run((Ctx::new([], &inputs), Val::from(input)));
+    let first = match out.next() {
+        None => return Err("jq produced no output".into()),
+        Some(Err(e)) => return Err(format!("jq: {e}")),
+        Some(Ok(v)) => v,
+    };
+    if out.next().is_some() {
+        return Err("jq produced multiple values; wrap the program in [...] to collect them".into());
+    }
+    Ok(first.into())
+}
+
+fn load_errors(errs: jaq_core::load::Errors<&str, ()>) -> String {
+    errs.into_iter()
+        .map(|(_, e)| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn compile_errors(errs: jaq_core::compile::Errors<&str, ()>) -> String {
+    errs.into_iter()
+        .flat_map(|(_, errs)| errs.into_iter().map(|(e, _)| format!("undefined {e:?}")))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Flatten an argument to numbers: arrays contribute each numeric element.
@@ -366,36 +466,98 @@ struct FormulaEntry {
     cached: Arc<Node>,
 }
 
-fn collect(root: &Arc<Node>) -> Result<Vec<FormulaEntry>> {
-    let mut found: Vec<(Pointer, String, Arc<Node>)> = Vec::new();
-    walk(root, |path, node| {
-        if let Node::Formula(f) = &**node {
-            found.push((path.clone(), f.expr.clone(), f.cached.clone()));
+/// Scan the entire tree for formula locations. Used once per store open /
+/// recovery; per-commit maintenance goes through `update_index`.
+pub fn scan_index(root: &Arc<Node>) -> BTreeSet<Pointer> {
+    let mut index = BTreeSet::new();
+    walk(root, |toks, node| {
+        if matches!(&**node, Node::Formula(_)) {
+            index.insert(Pointer::from_tokens(
+                toks.iter().map(|t| t.to_string()).collect(),
+            ));
         }
     });
-    let mut entries = Vec::with_capacity(found.len());
-    for (path, expr, cached) in found {
-        let ast = parse(&expr)?;
-        let deps = dependencies(&ast);
-        entries.push(FormulaEntry {
-            path,
-            expr,
-            ast,
-            deps,
-            cached,
-        });
-    }
-    Ok(entries)
+    index
 }
 
-/// Re-evaluate formulas affected by `changed` paths. Returns the new root and
+/// Incrementally maintain the formula index across a commit: `scan_roots`
+/// are the subtree roots the ops wrote into `root` (array element inserts /
+/// removes report the whole array, since siblings shift). Index entries
+/// overlapping a scan root are dropped and rediscovered by rescanning just
+/// that subtree — commits that never touch a formula-bearing subtree cost
+/// only the size of what they wrote, not the size of the document.
+pub fn update_index(
+    prev: &BTreeSet<Pointer>,
+    scan_roots: &[Pointer],
+    root: &Arc<Node>,
+) -> BTreeSet<Pointer> {
+    if scan_roots.is_empty() {
+        return prev.clone();
+    }
+    let mut index: BTreeSet<Pointer> = prev
+        .iter()
+        .filter(|e| !scan_roots.iter().any(|sr| sr.overlaps(e)))
+        .cloned()
+        .collect();
+    for sr in scan_roots {
+        // A dropped entry strictly above the scan root is untouched by the
+        // write unless the write replaced it; re-add it if it survived.
+        for e in prev.iter().filter(|e| e.is_prefix_of(sr) && *e != sr) {
+            if matches!(get_at(root, e).as_deref(), Some(Node::Formula(_))) {
+                index.insert(e.clone());
+            }
+        }
+        if let Some(sub) = get_at(root, sr) {
+            walk(&sub, |toks, node| {
+                if matches!(&**node, Node::Formula(_)) {
+                    let mut t = sr.tokens().to_vec();
+                    t.extend(toks.iter().map(|c| c.to_string()));
+                    index.insert(Pointer::from_tokens(t));
+                }
+            });
+        }
+    }
+    index
+}
+
+/// Materialize evaluation entries for the indexed formula locations.
+fn entries(root: &Arc<Node>, index: &BTreeSet<Pointer>) -> Result<Vec<FormulaEntry>> {
+    let mut out = Vec::with_capacity(index.len());
+    for p in index {
+        let Some(node) = get_at(root, p) else {
+            debug_assert!(false, "formula index points at missing node {p}");
+            continue;
+        };
+        let Node::Formula(f) = &*node else {
+            debug_assert!(false, "formula index points at non-formula {p}");
+            continue;
+        };
+        let ast = parse(&f.expr)?;
+        let deps = dependencies(&ast);
+        out.push(FormulaEntry {
+            path: p.clone(),
+            expr: f.expr.clone(),
+            ast,
+            deps,
+            cached: f.cached.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Re-evaluate formulas affected by `changed` paths, using the maintained
+/// `index` of formula locations (no tree scan). Returns the new root and
 /// the set of formula paths whose value actually changed. Errors with
 /// `FormulaCycle` if the dependency graph is cyclic.
 pub fn reevaluate(
     root: &Arc<Node>,
     changed: &BTreeSet<Pointer>,
+    index: &BTreeSet<Pointer>,
 ) -> Result<(Arc<Node>, BTreeSet<Pointer>)> {
-    let entries = collect(root)?;
+    if index.is_empty() {
+        return Ok((root.clone(), BTreeSet::new()));
+    }
+    let entries = entries(root, index)?;
     if entries.is_empty() {
         return Ok((root.clone(), BTreeSet::new()));
     }
