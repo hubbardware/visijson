@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-use jsondocstore::store::{Store, StoreConfig};
+use visijson::store::{Store, StoreConfig};
 use serde_json::json;
 use tempfile::TempDir;
 

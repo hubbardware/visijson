@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use jsondocstore::store::Store;
+use visijson::store::Store;
 use serde_json::json;
 
 #[test]

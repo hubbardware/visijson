@@ -1,8 +1,8 @@
 //! Formula correctness: evaluation, dependency-driven re-evaluation in
 //! topological order, cycle rejection, and error propagation.
 
-use jsondocstore::error::StoreError;
-use jsondocstore::store::Store;
+use visijson::error::StoreError;
+use visijson::store::Store;
 use serde_json::json;
 
 fn formula(expr: &str) -> serde_json::Value {
@@ -291,7 +291,7 @@ fn jq_view_depending_on_own_scope_is_a_cycle() {
 
 #[test]
 fn formula_in_array_survives_sibling_insert_shift() {
-    use jsondocstore::store::Op;
+    use visijson::store::Op;
     let store = Store::in_memory();
     store.put("/x", json!(1)).unwrap();
     store.put("/arr", json!([{"$formula": "/x + 1"}, "plain"])).unwrap();
@@ -303,7 +303,7 @@ fn formula_in_array_survives_sibling_insert_shift() {
         .commit(
             vec![Op::Insert {
                 path: "/arr/0".into(),
-                value: jsondocstore::model::from_value(&json!("first")),
+                value: visijson::model::from_value(&json!("first")),
             }],
             &[],
         )

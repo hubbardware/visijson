@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use jsondocstore::model::Pointer;
-use jsondocstore::store::Store;
-use jsondocstore::subscriptions::is_relevant;
+use visijson::model::Pointer;
+use visijson::store::Store;
+use visijson::subscriptions::is_relevant;
 use serde_json::json;
 
 #[tokio::test]

@@ -820,39 +820,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsondocstore"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "axum",
- "fs2",
- "futures-util",
- "imbl",
- "jaq-core",
- "jaq-json",
- "jaq-std",
- "jsondocstore-derive",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-tungstenite 0.23.1",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "jsondocstore-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1896,6 +1863,39 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "visijson"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "fs2",
+ "futures-util",
+ "imbl",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.23.1",
+ "tracing",
+ "tracing-subscriber",
+ "visijson-derive",
+]
+
+[[package]]
+name = "visijson-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "want"

@@ -1,8 +1,8 @@
 [package]
-name = "jsondocstore-derive"
+name = "visijson-derive"
 version = "0.1.0"
 edition = "2021"
-description = "#[derive(Document)] for jsondocstore's typed fast lane"
+description = "#[derive(Document)] for visijson's typed fast lane"
 license = "MIT"
 
 [lib]

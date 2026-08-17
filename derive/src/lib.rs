@@ -1,4 +1,4 @@
-//! `#[derive(Document)]`: generate `jsondocstore::typed::Document` for a
+//! `#[derive(Document)]`: generate `visijson::typed::Document` for a
 //! named-field struct — `to_node` builds the object tree, `diff_into`
 //! compares field-by-field against a previous value at native speed and
 //! emits ops only for fields that changed. Fields must themselves implement
@@ -42,7 +42,7 @@ pub fn derive_document(input: TokenStream) -> TokenStream {
         quote! {
             map.insert(
                 #key.to_string(),
-                ::jsondocstore::typed::Document::to_node(&self.#ident),
+                ::visijson::typed::Document::to_node(&self.#ident),
             );
         }
     });
@@ -51,7 +51,7 @@ pub fn derive_document(input: TokenStream) -> TokenStream {
         let key = ident.to_string();
         quote! {
             path.push(#key);
-            ::jsondocstore::typed::Document::diff_into(
+            ::visijson::typed::Document::diff_into(
                 &self.#ident,
                 &old.#ident,
                 path,
@@ -63,17 +63,17 @@ pub fn derive_document(input: TokenStream) -> TokenStream {
 
     let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
     quote! {
-        impl #impl_generics ::jsondocstore::typed::Document for #name #ty_generics #where_clause {
-            fn to_node(&self) -> ::std::sync::Arc<::jsondocstore::model::Node> {
-                let mut map = ::jsondocstore::typed::OrdMap::new();
+        impl #impl_generics ::visijson::typed::Document for #name #ty_generics #where_clause {
+            fn to_node(&self) -> ::std::sync::Arc<::visijson::model::Node> {
+                let mut map = ::visijson::typed::OrdMap::new();
                 #(#inserts)*
-                ::std::sync::Arc::new(::jsondocstore::model::Node::Object(map))
+                ::std::sync::Arc::new(::visijson::model::Node::Object(map))
             }
             fn diff_into<'doc>(
                 &'doc self,
                 old: &'doc Self,
-                path: &mut ::jsondocstore::typed::DiffPath<'doc>,
-                ops: &mut ::std::vec::Vec<::jsondocstore::store::Op>,
+                path: &mut ::visijson::typed::DiffPath<'doc>,
+                ops: &mut ::std::vec::Vec<::visijson::store::Op>,
             ) {
                 #(#diffs)*
             }

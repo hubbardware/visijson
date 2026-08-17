@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jsondocstore::api;
-use jsondocstore::store::{Store, StoreConfig};
+use visijson::api;
+use visijson::store::{Store, StoreConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

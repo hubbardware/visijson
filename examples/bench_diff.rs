@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use jsondocstore::store::Store;
-use jsondocstore::typed::{Document, TypedMount};
+use visijson::store::Store;
+use visijson::typed::{Document, TypedMount};
 use serde_json::{json, Map, Value};
 
 #[derive(Document, Clone, serde::Serialize)]
@@ -69,16 +69,16 @@ fn main() {
     // Where does single-field commit time go? Time the formula sweep alone.
     let head = store.head();
     let changed: std::collections::BTreeSet<_> =
-        [jsondocstore::model::Pointer::parse("/players/u00042/field_007").unwrap()]
+        [visijson::model::Pointer::parse("/players/u00042/field_007").unwrap()]
             .into_iter()
             .collect();
     let t = Instant::now();
-    jsondocstore::formulas::reevaluate(&head.root, &changed, &head.formulas).unwrap();
+    visijson::formulas::reevaluate(&head.root, &changed, &head.formulas).unwrap();
     println!("formulas::reevaluate (no formulas):  {:?}", t.elapsed());
 
     // The one-time cost the index replaces: a full-tree formula scan.
     let t = Instant::now();
-    let index = jsondocstore::formulas::scan_index(&head.root);
+    let index = visijson::formulas::scan_index(&head.root);
     println!("full scan_index (open/recovery only): {:?} ({} formulas)", t.elapsed(), index.len());
 
     // Typed fast lane: native struct diffing via #[derive(Document)].

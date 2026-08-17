@@ -1,4 +1,7 @@
-# jsondocstore
+# VisiJson
+
+*A spreadsheet for JSON — cells are pointers, formulas recalculate on commit,
+and everyone watching sees the change.*
 
 An in-memory JSON document store built on **immutable persistent tree nodes**
 (`Arc<Node>`) with **atomic root swaps** (`ArcSwap<Committed>`). Every write is
@@ -185,7 +188,7 @@ curl -X PUT localhost:8080/doc/roster -H 'content-type: application/json' \
 The common types re-export at the crate root:
 
 ```rust
-use jsondocstore::{Store, StoreConfig, Op, Condition, Document, TypedMount};
+use visijson::{Store, StoreConfig, Op, Condition, Document, TypedMount};
 ```
 
 **Open a store** — `Store::in_memory()` for no persistence, or:
@@ -246,7 +249,7 @@ while let Ok(ev) = rx.recv().await {
 **Embed the HTTP server** (optional): `api::router(doc, info)` is an axum
 `Router`; `api::spawn_info_ticker(info, period)` runs the heartbeat.
 
-Lower-level tree tools live in `jsondocstore::model`: `Pointer`,
+Lower-level tree tools live in `visijson::model`: `Pointer`,
 path-copy `get_at`/`set_at`/`insert_at`/`remove_at` on any root,
 `diff_paths`, `merge_patch_diff`, `reconcile`, `walk`, and `PlainView`
 (streaming formula-resolved serialization — pairs with `get_node`).

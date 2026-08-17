@@ -9,7 +9,7 @@ pub mod subscriptions;
 pub mod typed;
 
 // The 90% path, importable without knowing the module layout:
-// `use jsondocstore::{Store, TypedMount, Document, ...};`
+// `use visijson::{Store, TypedMount, Document, ...};`
 pub use error::{Result, StoreError};
 pub use meta::Stamp;
 pub use model::{Node, PlainView, Pointer};

@@ -1,7 +1,7 @@
 //! Basic store semantics: pointers, path-copy writes, structural sharing,
 //! changed-path recording.
 
-use jsondocstore::store::{shares_subtree, Store};
+use visijson::store::{shares_subtree, Store};
 use serde_json::json;
 
 #[test]
@@ -85,7 +85,7 @@ fn put_records_only_genuinely_changed_paths() {
 
 #[test]
 fn array_insert_and_remove_report_the_whole_array() {
-    use jsondocstore::store::Op;
+    use visijson::store::Op;
     let store = Store::in_memory();
     store.put("/l", json!([1, 2, 3])).unwrap();
 
@@ -94,7 +94,7 @@ fn array_insert_and_remove_report_the_whole_array() {
         .commit(
             vec![Op::Insert {
                 path: "/l/1".into(),
-                value: jsondocstore::model::from_value(&json!(9)),
+                value: visijson::model::from_value(&json!(9)),
             }],
             &[],
         )
@@ -210,15 +210,15 @@ fn old_snapshots_remain_readable_after_new_commits() {
     let old = store.head();
     store.put("/v", json!(2)).unwrap();
     // The old immutable root still reads its own value.
-    let ptr = jsondocstore::model::Pointer::parse("/v").unwrap();
-    let node = jsondocstore::model::get_at(&old.root, &ptr).unwrap();
-    assert_eq!(jsondocstore::model::to_plain_value(&node), json!(1));
+    let ptr = visijson::model::Pointer::parse("/v").unwrap();
+    let node = visijson::model::get_at(&old.root, &ptr).unwrap();
+    assert_eq!(visijson::model::to_plain_value(&node), json!(1));
     assert_eq!(store.get("/v").unwrap(), Some(json!(2)));
 }
 
 #[test]
 fn full_replace_reconciles_structural_sharing() {
-    use jsondocstore::store::shares_subtree;
+    use visijson::store::shares_subtree;
     let store = Store::in_memory();
     store
         .put("/things", json!({"t1": {"v": 1}, "t2": {"v": 2}, "t3": {"v": 3}}))

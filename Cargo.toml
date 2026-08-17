@@ -1,8 +1,8 @@
 [package]
-name = "jsondocstore"
+name = "visijson"
 version = "0.1.0"
 edition = "2021"
-description = "In-memory JSON document store with immutable persistent tree nodes, atomic root swaps, formulas, subscriptions, and WAL persistence"
+description = "Reactive in-memory JSON document store: spreadsheet-style formulas, live subscriptions over WebSocket/SSE, immutable persistent tree nodes with atomic root swaps, and WAL persistence"
 license = "MIT"
 
 [dependencies]
@@ -11,7 +11,7 @@ axum = { version = "0.7", features = ["ws"] }
 fs2 = "0.4"
 futures-util = "0.3"
 imbl = "7.0.1"
-jsondocstore-derive = { path = "derive" }
+visijson-derive = { path = "derive" }
 jaq-core = "2"
 jaq-json = { version = "1", features = ["serde_json"] }
 jaq-std = "2"

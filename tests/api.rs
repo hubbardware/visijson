@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use jsondocstore::api::router;
-use jsondocstore::store::Store;
+use visijson::api::router;
+use visijson::store::Store;
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -216,7 +216,7 @@ async fn browsers_get_the_embedded_ui_api_clients_get_json() {
         let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
         assert!(ct.starts_with("text/html"), "GET {path} → {ct}");
         let body = resp.text().await.unwrap();
-        assert!(body.contains("jsondocstore"), "UI page not served for {path}");
+        assert!(body.contains("visijson"), "UI page not served for {path}");
     }
 
     // JSON Accept (and curl's */*) still get data + real 404s.
@@ -254,7 +254,7 @@ async fn browsers_get_the_embedded_ui_api_clients_get_json() {
 #[tokio::test]
 async fn info_ticker_heartbeats_beside_the_doc() {
     let (base, store, info) = serve().await;
-    jsondocstore::api::spawn_info_ticker(info.clone(), std::time::Duration::from_millis(20));
+    visijson::api::spawn_info_ticker(info.clone(), std::time::Duration::from_millis(20));
 
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     let v = info.get("").unwrap().expect("info root should exist");

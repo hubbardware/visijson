@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use jsondocstore::error::StoreError;
-use jsondocstore::store::{Condition, Op, Store, StoreConfig};
+use visijson::error::StoreError;
+use visijson::store::{Condition, Op, Store, StoreConfig};
 use serde_json::json;
 
 #[test]
@@ -104,7 +104,7 @@ fn conditions_guard_commits() {
         .commit(
             vec![Op::Put {
                 path: "/state".into(),
-                value: jsondocstore::model::from_value(&json!("published")),
+                value: visijson::model::from_value(&json!("published")),
             }],
             &[Condition {
                 path: "/state".into(),
@@ -119,7 +119,7 @@ fn conditions_guard_commits() {
         .commit(
             vec![Op::Put {
                 path: "/state".into(),
-                value: jsondocstore::model::from_value(&json!("archived")),
+                value: visijson::model::from_value(&json!("archived")),
             }],
             &[Condition {
                 path: "/state".into(),
@@ -135,7 +135,7 @@ fn conditions_guard_commits() {
         .commit(
             vec![Op::Put {
                 path: "/state".into(),
-                value: jsondocstore::model::from_value(&json!("x")),
+                value: visijson::model::from_value(&json!("x")),
             }],
             &[Condition {
                 path: "/state".into(),

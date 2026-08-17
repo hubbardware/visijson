@@ -27,7 +27,7 @@ use crate::model::{FormulaNode, Node, Pointer, FORMULA_KEY, FORMULA_VALUE_KEY};
 use crate::store::{CommitInfo, Op, Store};
 
 pub use imbl::OrdMap;
-pub use jsondocstore_derive::Document;
+pub use visijson_derive::Document;
 
 // ------------------------------------------------------------- to_node
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>jsondocstore</title>
+<title>visijson</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230a0f0d'/%3E%3Ctext x='8' y='12' font-family='monospace' font-size='11' font-weight='bold' fill='%233fe08f' text-anchor='middle'%3E%7B%7D%3C/text%3E%3C/svg%3E">
 <style>
   :root {
@@ -236,7 +236,7 @@
 <body>
 <div class="app">
   <header>
-    <div class="wordmark">json<span class="dim-mark">·</span>doc<span class="dim-mark">·</span>store</div>
+    <div class="wordmark">visi<span class="dim-mark">·</span>json</div>
     <nav class="crumbs" id="crumbs"></nav>
     <div class="status">
       <span class="led" id="led"></span>
@@ -309,7 +309,7 @@ const state = {
   logCount: 0,
   reconnectDelay: 400,
 };
-document.title = (state.pointer || "/") + " · jsondocstore";
+document.title = (state.pointer || "/") + " · visijson";
 
 // ------------------------------------------------ breadcrumbs
 function renderCrumbs() {

@@ -3,8 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use jsondocstore::store::Store;
-use jsondocstore::typed::{to_node, Document, TypedMount};
+use visijson::store::Store;
+use visijson::typed::{to_node, Document, TypedMount};
 use serde_json::json;
 
 #[derive(Document, Clone)]
@@ -72,7 +72,7 @@ fn to_node_recognizes_formula_shapes() {
     .unwrap();
     assert!(matches!(
         &*n,
-        jsondocstore::model::Node::Formula(f) if f.expr == "/a + 1"
+        visijson::model::Node::Formula(f) if f.expr == "/a + 1"
     ));
 }
 

@@ -93,7 +93,7 @@ impl Persistence {
             std::io::Error::new(
                 e.kind(),
                 format!(
-                    "data dir {} is already locked by another jsondocstore process",
+                    "data dir {} is already locked by another visijson process",
                     dir.display()
                 ),
             )
