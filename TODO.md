@@ -73,15 +73,27 @@ distinguishes them. Breaking change for `onmessage` consumers (named
 events don't fire it) — accepted, pre-users.
 
 Still open:
-- **Honor `Last-Event-ID` on SSE reconnect.** `EventSource` auto-reconnects
-  and sends the last `id:` it saw — which is a commit version. Today a
-  reconnect always gets a full snapshot; a client that's nearly current
-  could instead be resumed with just the missed changes (diff the
-  reconnecting version's... we don't retain old roots by version, but the
-  current head diffed against nothing requires a snapshot — the cheap
-  win is: if `Last-Event-ID` == current published version, send no
-  snapshot at all, just the live stream; anything older falls back to a
-  `snapshot` with `"resync": true`).
+- **Honor `Last-Event-ID` on SSE reconnect** (design settled 2026-08-18).
+  `EventSource` auto-reconnects sending the last `id:` it saw — a commit
+  version V. No patch log is needed: patches are computed by diffing
+  roots, so resuming needs only *old roots*, which structural sharing
+  makes cheap (and the broadcast ring already pins the last ~1024
+  `Arc<Committed>`s anyway). Three-rung ladder, each degrading safely to
+  the next:
+  1. `mods.last_modified(ptr).version <= V` → subtree untouched since the
+     client left: send nothing, resume the live stream. Zero retention,
+     covers the common quiet-reconnect case, kills the reconnect
+     snapshot herd. Over-estimation just falls through to rung 2/3.
+  2. Root@V still retained (small `VecDeque<(version, Arc<Committed>)>`
+     in the Hub, trimmed by count/age — near-zero extra memory since the
+     Arcs are shared with the broadcast ring) → one *coalesced* catch-up
+     `change` patch diffing root@V vs current at ptr, then stream.
+     Watch the retention bound: a big replace pins its displaced subtree
+     until it ages out.
+  3. Otherwise → today's `snapshot` with `"resync": true` (always
+     correct; retention is purely an optimization dial).
+  Implement 1+3 first; add the ring only if reconnect-under-heavy-writes
+  shows up as a real cost.
 
 ## 4. UI: grey out edit controls where the user can't write
 
