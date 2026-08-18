@@ -46,6 +46,18 @@ impl Committed {
     }
 }
 
+/// Contention backoff: yield for the first couple of retries, then sleep
+/// exponentially longer (40µs .. 2.5ms) so hot-key contention can't starve
+/// one writer through its whole retry budget.
+fn backoff(attempt: u32) {
+    if attempt >= 2 {
+        let micros = 10u64 << attempt.min(8);
+        std::thread::sleep(std::time::Duration::from_micros(micros));
+    } else {
+        std::thread::yield_now();
+    }
+}
+
 /// Wall-clock milliseconds since the epoch.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -397,16 +409,17 @@ impl Store {
     /// guarantees they held at commit time. `Conflict` means a condition
     /// failed; CAS races are retried internally and never surface.
     pub fn commit(&self, ops: Vec<Op>, conditions: &[Condition]) -> Result<CommitInfo> {
-        loop {
+        for attempt in 0..self.max_retries {
             let cur = self.current.load_full();
             check_conditions(&cur.root, conditions)?;
             // Commit time never runs backwards, whatever the wall clock does.
             let time_ms = now_ms().max(cur.time_ms);
             match self.try_commit(&cur, &ops, time_ms)? {
                 Some(info) => return Ok(info),
-                None => continue, // CAS lost; replay against new root
+                None => backoff(attempt), // CAS lost; replay against new root
             }
         }
+        Err(StoreError::RetryLimit(self.max_retries))
     }
 
     /// When was the subtree at `path` last modified? Over-estimates rather
@@ -425,6 +438,9 @@ impl Store {
         ops: &[Op],
         time_ms: u64,
     ) -> Result<Option<CommitInfo>> {
+        // A broken WAL fail-stops writes before any state changes hands —
+        // a commit that could never recover must not CAS in.
+        self.hub.check_writable()?;
         let (root, changed, scan_roots) = apply_ops(&cur.root, ops)?;
         let formulas = formulas::update_index(&cur.formulas, &scan_roots, &root)?;
         let (root, fchanged) = formulas::reevaluate(&root, &changed, &formulas)?;
@@ -466,11 +482,13 @@ impl Store {
                     time_ms: p.committed.time_ms,
                     ops: p.ops.clone(),
                 };
-                if let Err(e) = persistence.append(&record) {
-                    tracing::error!(version = p.committed.version, error = %e, "WAL append failed");
-                }
+                persistence.append(&record).inspect_err(|e| {
+                    tracing::error!(version = p.committed.version, error = %e,
+                        "WAL append failed; store is fail-stopped for writes");
+                })?;
             }
-        });
+            Ok(())
+        })?;
         tracing::debug!(version = next.version, changed = ?changed_paths, "commit");
         Ok(Some(CommitInfo {
             version: next.version,
@@ -510,14 +528,7 @@ impl Store {
                 Ok(info) => return Ok((out, info, attempt)),
                 Err(StoreError::Conflict(reason)) => {
                     tracing::debug!(attempt, %reason, "transaction conflict, retrying");
-                    // Back off so hot-key contention can't starve one writer
-                    // through the whole retry budget.
-                    if attempt >= 2 {
-                        let micros = 10u64 << attempt.min(8); // 40µs .. 2.5ms
-                        std::thread::sleep(std::time::Duration::from_micros(micros));
-                    } else {
-                        std::thread::yield_now();
-                    }
+                    backoff(attempt);
                     continue;
                 }
                 Err(e) => return Err(e),

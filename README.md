@@ -320,6 +320,12 @@ whole-store validators.
 - Commits publish through an ordering stage that flushes strictly by version:
   WAL append and event broadcast happen in the same order, and subscribers
   get a snapshot plus exactly the events after it — no gaps, no reordering.
+- A commit does not return until its own WAL record has been written (and
+  fsynced, if fsync is enabled) — ack implies durable to the WAL's configured
+  strength. If a WAL append ever fails, the store fail-stops for writes:
+  the failing commit and everything queued behind it error, and every
+  subsequent write is rejected up front rather than silently lost; restart
+  recovers to the last durable record.
 - Snapshots are written under the publication lock, so the WAL rotation point
   is exact; recovery = snapshot + replay of newer WAL records.
 

@@ -91,6 +91,7 @@ impl IntoResponse for ApiError {
             | StoreError::TypeMismatch { .. }
             | StoreError::FormulaParse { .. }
             | StoreError::Unsupported(_) => StatusCode::BAD_REQUEST,
+            StoreError::WalBroken(_) => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::Io(_) | StoreError::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.0.to_string() }))).into_response()

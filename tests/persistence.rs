@@ -195,6 +195,32 @@ fn wal_records_effects_not_whole_requests() {
 }
 
 #[test]
+fn commit_ack_implies_wal_record_on_disk() {
+    let dir = TempDir::new().unwrap();
+    let store = open(dir.path());
+    let wal = dir.path().join("wal.log");
+    // Racing writers CAS in any order, but a commit must not return until
+    // its own WAL record is written — the instant `put` acks version V,
+    // V's record must be readable from the file.
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let store = store.clone();
+            let wal = wal.clone();
+            s.spawn(move || {
+                for i in 0..25 {
+                    let v = store.put(&format!("/t{t}/i{i}"), json!(i)).unwrap().version;
+                    let content = std::fs::read_to_string(&wal).unwrap();
+                    assert!(
+                        content.contains(&format!("\"version\":{v}")),
+                        "commit acked v{v} but the WAL on disk lacks its record"
+                    );
+                }
+            });
+        }
+    });
+}
+
+#[test]
 fn foreign_snapshot_cycle_only_rejects_commits_that_touch_it() {
     let dir = TempDir::new().unwrap();
     // A formula cycle can't be committed through the API; simulate a

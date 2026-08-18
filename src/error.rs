@@ -18,6 +18,8 @@ pub enum StoreError {
     FormulaCycle(String),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+    #[error("write-ahead log failed, store is fail-stopped for writes: {0}")]
+    WalBroken(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

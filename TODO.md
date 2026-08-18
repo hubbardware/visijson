@@ -139,16 +139,25 @@ includes a formula this commit wrote, so it is always seeded. Pinned by
 
 ## 8. Durability defects
 
-- **A commit can ack before its WAL record is written.** Commits buffer by
-  version in `Hub::finalize`; one that CASes out of order returns success
-  and a later thread writes its record. A crash in between loses an acked
-  commit.
-- **WAL errors are swallowed** (store.rs:469-471) — `commit()` returns `Ok`
-  on a full disk. Should fail-stop: check before the CAS so a broken log
-  rejects writes instead of silently losing them.
-- **`Store::commit` spins with no backoff and no cap** (store.rs:399-410),
-  redoing all preparation each pass. `Store::transaction` already has the
-  right ladder; reuse it.
+**Done (2026-08-18):**
+- `Hub::finalize` now returns `Result` and blocks (condvar) until the
+  caller's own record has been flushed — by whichever thread drained it —
+  so a successful `commit()` always means the record is written (and
+  fsynced, when fsync is on). Pinned by
+  `commit_ack_implies_wal_record_on_disk` (8 threads × 25 commits, WAL
+  re-read from disk the instant each ack returns) and Hub unit tests.
+- A failed WAL append **poisons the hub**: the failing commit and every
+  waiter behind the hole get an error, nothing past the hole is broadcast,
+  and all subsequent writes fail fast with `WalBroken` (HTTP 503) —
+  checked before the CAS, so a commit that could never recover never
+  enters memory. Reads still serve; restart recovers to the last durable
+  record.
+- `Store::commit` now uses the same backoff ladder as `transaction`
+  (shared `backoff()`) and caps at `max_retries` → `RetryLimit`.
+
+Still open (moved under #9): the fsync itself is still inline, per commit,
+inside the publication mutex — group commit / a dedicated writer thread is
+the throughput half.
 
 ## 9. Write throughput: get I/O off the critical path
 
@@ -158,7 +167,8 @@ includes a formula this commit wrote, so it is always seeded. Pinned by
   group commit. Keep the channel send *inside* the mutex so WAL order ==
   version order still holds; only the I/O leaves. `Durability::{Sync,
   Async, NoFsync}`, default `Sync` — concurrent writers share one fsync but
-  a commit still returns only once its own record is durable (also fixes #8).
+  a commit still returns only once its own record is durable, preserving
+  the ack-implies-written guarantee and fail-stop from #8.
 - **Snapshots hold the publication lock across whole-document serialize +
   `sync_all` + rename + WAL truncate**, stalling every commit *and every new
   subscriber connection* (`Hub::subscribe` shares the mutex) for a duration
