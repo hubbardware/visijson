@@ -22,7 +22,7 @@ use crate::model::{
     self, empty_object, from_value, get_at, insert_at, nodes_equal, remove_at, set_at,
     to_plain_value, to_raw_value, Node, Pointer,
 };
-use crate::persistence::{Persistence, WalRecord};
+use crate::persistence::{Durability, Persistence, WalRecord};
 use crate::stats::Stats;
 use crate::subscriptions::{CommitEvent, Hub, Pending};
 
@@ -104,8 +104,8 @@ pub struct CommitInfo {
 pub struct StoreConfig {
     /// Directory for WAL + snapshots; `None` disables persistence.
     pub data_dir: Option<PathBuf>,
-    /// fsync the WAL on every commit.
-    pub fsync: bool,
+    /// What a commit ack promises about its WAL record (see `Durability`).
+    pub durability: Durability,
     /// Max optimistic transaction retries before giving up.
     pub max_retries: u32,
 }
@@ -114,7 +114,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
             data_dir: None,
-            fsync: true,
+            durability: Durability::Sync,
             max_retries: 64,
         }
     }
@@ -122,7 +122,7 @@ impl Default for StoreConfig {
 
 pub struct Store {
     current: ArcSwap<Committed>,
-    hub: Hub,
+    hub: Arc<Hub>,
     persistence: Option<Persistence>,
     max_retries: u32,
     stats: Arc<Stats>,
@@ -298,15 +298,14 @@ fn check_conditions(root: &Arc<Node>, conditions: &[Condition]) -> Result<()> {
 impl Store {
     pub fn open(cfg: StoreConfig) -> Result<Arc<Store>> {
         let stats = Arc::new(Stats::default());
-        let rec = match &cfg.data_dir {
+        let (mut persistence, rec) = match &cfg.data_dir {
             Some(dir) => {
-                let p = Persistence::open(dir, cfg.fsync, stats.clone())?;
+                let p = Persistence::open(dir, cfg.durability, stats.clone())?;
                 let rec = p.recover()?;
                 (Some(p), rec)
             }
             None => (None, crate::persistence::Recovered::empty()),
         };
-        let (persistence, rec) = rec;
         let committed = Arc::new(Committed {
             version: rec.version,
             time_ms: rec.time_ms,
@@ -314,9 +313,13 @@ impl Store {
             formulas: rec.formulas,
             mods: rec.mods,
         });
+        let hub = Arc::new(Hub::new(committed.clone(), persistence.is_some()));
+        if let Some(p) = persistence.as_mut() {
+            p.start_writer(hub.clone(), committed.version)?;
+        }
         Ok(Arc::new(Store {
-            current: ArcSwap::from(committed.clone()),
-            hub: Hub::new(committed),
+            current: ArcSwap::from(committed),
+            hub,
             persistence,
             max_retries: cfg.max_retries,
             stats,
@@ -450,6 +453,9 @@ impl Store {
         // A broken WAL fail-stops writes before any state changes hands —
         // a commit that could never recover must not CAS in.
         self.hub.check_writable()?;
+        if let Some(persistence) = &self.persistence {
+            persistence.check_writable()?;
+        }
         let (root, changed, scan_roots) = apply_ops(&cur.root, ops)?;
         let formulas = formulas::update_index(&cur.formulas, &scan_roots, &root)?;
         let (root, fchanged) = formulas::reevaluate(&root, &changed, &formulas)?;
@@ -481,30 +487,38 @@ impl Store {
             return Ok(None);
         }
         Stats::bump(&self.stats.commits);
-        let changed_paths: Vec<String> = all.iter().map(|p| p.to_string()).collect();
+        let changed_paths = Arc::new(all.iter().map(|p| p.to_string()).collect::<Vec<_>>());
         let pending = Pending {
             committed: next.clone(),
             changed_paths: changed_paths.clone(),
             ops: wal_ops,
         };
-        self.hub.finalize(pending, |p| {
+        // The sink hands the record (and its event) to the WAL writer in
+        // version order; broadcast happens once the batch is durable. For
+        // in-memory stores the sink is a no-op and the Hub broadcasts.
+        self.hub.finalize(pending, |p, event| {
             if let Some(persistence) = &self.persistence {
                 let record = WalRecord {
                     version: p.committed.version,
                     time_ms: p.committed.time_ms,
                     ops: p.ops.clone(),
                 };
-                persistence.append(&record).inspect_err(|e| {
+                persistence.enqueue(&record, event.clone()).inspect_err(|e| {
                     tracing::error!(version = p.committed.version, error = %e,
-                        "WAL append failed; store is fail-stopped for writes");
+                        "WAL enqueue failed; store is fail-stopped for writes");
                 })?;
             }
             Ok(())
         })?;
+        // Group commit: block until our record reaches the configured
+        // durability level (batch-mates wake together off one fsync).
+        if let Some(persistence) = &self.persistence {
+            persistence.wait_durable(next.version)?;
+        }
         tracing::debug!(version = next.version, changed = ?changed_paths, "commit");
         Ok(Some(CommitInfo {
             version: next.version,
-            changed_paths,
+            changed_paths: changed_paths.as_ref().clone(),
         }))
     }
 
@@ -592,22 +606,34 @@ impl Store {
         &self.hub
     }
 
-    /// Write a snapshot of the latest published state and rotate the WAL.
-    /// Returns the snapshotted version, or `None` if persistence is disabled.
+    /// Write a snapshot and retire the WAL segments it supersedes. Returns
+    /// the snapshotted version, or `None` if persistence is disabled.
+    ///
+    /// Commits are never stalled for the duration of the document: the
+    /// publication lock is held only to pin the latest enqueued state and
+    /// mark a segment rotation at exactly that boundary; serializing the
+    /// (immutable, `Arc`-pinned) tree, fsync, and rename all run outside
+    /// it, and sealed segments are deleted only after the rename lands — a
+    /// crash at any point recovers to the same state.
     pub fn snapshot(&self) -> Result<Option<u64>> {
         let Some(persistence) = &self.persistence else {
             return Ok(None);
         };
-        // Publication (and thus WAL append) is locked out while we write the
-        // snapshot and truncate the WAL, so the rotation point is exact.
-        self.hub.with_publish_lock(|published| {
-            let t = std::time::Instant::now();
-            persistence.write_snapshot(published.version, published.time_ms, &published.root)?;
-            Stats::bump(&self.stats.snapshots);
-            Stats::add(&self.stats.snapshot_micros, t.elapsed().as_micros() as u64);
-            tracing::info!(version = published.version, "snapshot written");
-            Ok(Some(published.version))
-        })
+        let _one_at_a_time = persistence.snapshot_guard();
+        let t = std::time::Instant::now();
+        let (pinned, rotation) = self.hub.latest_enqueued(|enqueued| {
+            let rotation = persistence.request_rotation()?;
+            Ok::<_, StoreError>((enqueued.clone(), rotation))
+        })?;
+        let sealed = rotation
+            .recv()
+            .map_err(|_| StoreError::WalBroken("WAL writer thread exited".into()))??;
+        persistence.write_snapshot(pinned.version, pinned.time_ms, &pinned.root)?;
+        persistence.prune(&sealed);
+        Stats::bump(&self.stats.snapshots);
+        Stats::add(&self.stats.snapshot_micros, t.elapsed().as_micros() as u64);
+        tracing::info!(version = pinned.version, "snapshot written");
+        Ok(Some(pinned.version))
     }
 }
 

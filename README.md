@@ -317,17 +317,25 @@ whole-store validators.
   formulas topologically → CAS the root. CAS losers replay against the new
   root; transaction commits additionally validate their read-set and abort
   with a conflict (retrying the closure) if any read was invalidated.
-- Commits publish through an ordering stage that flushes strictly by version:
-  WAL append and event broadcast happen in the same order, and subscribers
-  get a snapshot plus exactly the events after it — no gaps, no reordering.
-- A commit does not return until its own WAL record has been written (and
-  fsynced, if fsync is enabled) — ack implies durable to the WAL's configured
-  strength. If a WAL append ever fails, the store fail-stops for writes:
-  the failing commit and everything queued behind it error, and every
-  subsequent write is rejected up front rather than silently lost; restart
-  recovers to the last durable record.
-- Snapshots are written under the publication lock, so the WAL rotation point
-  is exact; recovery = snapshot + replay of newer WAL records.
+- Commits publish through an ordering stage that hands records to a dedicated
+  WAL writer thread strictly by version: WAL order == broadcast order ==
+  version order, and subscribers get a snapshot plus exactly the events after
+  it — no gaps, no reordering. The writer batches whatever queued up during
+  the previous write into one fsync (group commit), so concurrent writers
+  share fsyncs and throughput scales with load.
+- A commit does not return until its own WAL record has been written
+  (`Durability::Async`/`NoFsync`) or fsynced (`Durability::Sync`, the
+  default) — ack implies durable to the configured strength, and events are
+  broadcast only after their batch reaches that level, so subscribers never
+  observe a commit a crash could take back. If a WAL write ever fails, the
+  store fail-stops: the failing commit and everything queued behind it
+  error, and every subsequent write is rejected up front rather than
+  silently lost; restart recovers to the last durable record.
+- Snapshots never stall commits: the publication lock is held only to pin a
+  version and mark a WAL segment rotation at that exact boundary; the
+  document serializes outside the lock and superseded segments are deleted
+  after the snapshot lands. Recovery = snapshot + replay of newer WAL
+  records (legacy `wal.log` first, then `wal/` segments in order).
 
 ## Tests
 

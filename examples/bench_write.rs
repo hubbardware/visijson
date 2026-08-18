@@ -13,6 +13,7 @@ use std::time::Instant;
 use serde_json::json;
 use tempfile::TempDir;
 use visijson::store::{Store, StoreConfig};
+use visijson::Durability;
 
 fn open(durability: &str) -> (Arc<Store>, Option<TempDir>) {
     match durability {
@@ -21,7 +22,11 @@ fn open(durability: &str) -> (Arc<Store>, Option<TempDir>) {
             let dir = TempDir::new().unwrap();
             let store = Store::open(StoreConfig {
                 data_dir: Some(dir.path().to_path_buf()),
-                fsync: other == "fsync",
+                durability: match other {
+                    "fsync" => Durability::Sync,
+                    "async" => Durability::Async,
+                    _ => Durability::NoFsync,
+                },
                 ..StoreConfig::default()
             })
             .unwrap();
@@ -67,7 +72,7 @@ fn run(label: &str, store: &Arc<Store>, writers: usize, ops_per: usize, formulas
 }
 
 fn main() {
-    for durability in ["mem", "nofsync", "fsync"] {
+    for durability in ["mem", "nofsync", "async", "fsync"] {
         let ops_per = if durability == "fsync" { 100 } else { 5000 };
         for writers in [1, 2, 4, 8] {
             let (store, _dir) = open(durability);

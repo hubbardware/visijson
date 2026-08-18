@@ -3,19 +3,41 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use visijson::store::{Store, StoreConfig};
 use serde_json::json;
 use tempfile::TempDir;
+use visijson::store::{Store, StoreConfig};
+use visijson::Durability;
 
 fn open(dir: &Path) -> std::sync::Arc<Store> {
+    open_with(dir, Durability::NoFsync) // tests simulate process death, not power loss
+}
+
+fn open_with(dir: &Path, durability: Durability) -> std::sync::Arc<Store> {
     Store::open(StoreConfig {
         data_dir: Some(dir.to_path_buf()),
-        fsync: false, // tests simulate process death, not power loss
+        durability,
         ..StoreConfig::default()
     })
     .unwrap()
+}
+
+/// All WAL content in replay order: legacy `wal.log` then segments.
+fn read_wal(dir: &Path) -> String {
+    let mut out = std::fs::read_to_string(dir.join("wal.log")).unwrap_or_default();
+    for seg in segment_paths(dir) {
+        out.push_str(&std::fs::read_to_string(seg).unwrap_or_default());
+    }
+    out
+}
+
+fn segment_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("wal"))
+        .map(|rd| rd.filter_map(|e| Some(e.ok()?.path())).collect())
+        .unwrap_or_default();
+    segs.sort();
+    segs
 }
 
 #[test]
@@ -82,11 +104,10 @@ fn torn_wal_tail_is_tolerated() {
         store.put("/a", json!(1)).unwrap();
         store.put("/b", json!(2)).unwrap();
     }
-    // Simulate a crash mid-append: garbage half-record at the WAL tail.
-    let mut f = OpenOptions::new()
-        .append(true)
-        .open(dir.path().join("wal.log"))
-        .unwrap();
+    // Simulate a crash mid-append: garbage half-record at the tail of the
+    // last WAL segment.
+    let last = segment_paths(dir.path()).pop().expect("a WAL segment");
+    let mut f = OpenOptions::new().append(true).open(last).unwrap();
     f.write_all(b"{\"version\":3,\"ops\":[{\"op\":\"put\",\"pa").unwrap();
     drop(f);
 
@@ -174,7 +195,7 @@ fn wal_records_effects_not_whole_requests() {
         assert_eq!(store.version(), v);
     }
 
-    let wal = std::fs::read_to_string(dir.path().join("wal.log")).unwrap();
+    let wal = read_wal(dir.path());
     let lines: Vec<&str> = wal.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 2, "elided commit must not append: {wal}");
     // The second record is the effect (just /things/n), not the request.
@@ -198,26 +219,136 @@ fn wal_records_effects_not_whole_requests() {
 fn commit_ack_implies_wal_record_on_disk() {
     let dir = TempDir::new().unwrap();
     let store = open(dir.path());
-    let wal = dir.path().join("wal.log");
     // Racing writers CAS in any order, but a commit must not return until
     // its own WAL record is written — the instant `put` acks version V,
-    // V's record must be readable from the file.
+    // V's record must be readable from the files.
     std::thread::scope(|s| {
         for t in 0..8 {
             let store = store.clone();
-            let wal = wal.clone();
+            let dir = dir.path();
             s.spawn(move || {
                 for i in 0..25 {
                     let v = store.put(&format!("/t{t}/i{i}"), json!(i)).unwrap().version;
-                    let content = std::fs::read_to_string(&wal).unwrap();
                     assert!(
-                        content.contains(&format!("\"version\":{v}")),
+                        read_wal(dir).contains(&format!("\"version\":{v}")),
                         "commit acked v{v} but the WAL on disk lacks its record"
                     );
                 }
             });
         }
     });
+}
+
+#[test]
+fn group_commit_batches_fsyncs_across_concurrent_writers() {
+    let dir = TempDir::new().unwrap();
+    let store = open_with(dir.path(), Durability::Sync);
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let store = store.clone();
+            s.spawn(move || {
+                for i in 0..25 {
+                    store.put(&format!("/t{t}/i{i}"), json!(i)).unwrap();
+                }
+            });
+        }
+    });
+    let stats = store.stats();
+    assert_eq!(stats.wal_records, 200);
+    // Writers queue while the previous batch fsyncs, so batches must have
+    // formed — strictly fewer fsyncs than records.
+    assert!(
+        stats.wal_fsyncs < stats.wal_records,
+        "no batching: {} fsyncs for {} records",
+        stats.wal_fsyncs,
+        stats.wal_records
+    );
+    // And every record survives a restart.
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(store.version(), 200);
+}
+
+#[test]
+fn all_durability_modes_recover_identically() {
+    for durability in [Durability::Sync, Durability::Async, Durability::NoFsync] {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = open_with(dir.path(), durability);
+            store.put("/a", json!(1)).unwrap();
+            store.put("/b/c", json!([1, 2])).unwrap();
+            store.snapshot().unwrap();
+            store.put("/a", json!(2)).unwrap();
+        }
+        let store = open(dir.path());
+        assert_eq!(store.version(), 3, "{durability:?}");
+        assert_eq!(store.get("/a").unwrap(), Some(json!(2)), "{durability:?}");
+        assert_eq!(store.get("/b/c").unwrap(), Some(json!([1, 2])), "{durability:?}");
+    }
+}
+
+#[test]
+fn legacy_single_file_wal_is_still_replayed() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("wal.log"),
+        concat!(
+            "{\"version\":1,\"time_ms\":5,\"ops\":[{\"op\":\"put\",\"path\":\"/old\",\"value\":1}]}\n",
+            "{\"version\":2,\"time_ms\":6,\"ops\":[{\"op\":\"put\",\"path\":\"/old2\",\"value\":2}]}\n",
+        ),
+    )
+    .unwrap();
+    let store = open(dir.path());
+    assert_eq!(store.version(), 2);
+    assert_eq!(store.get("/old").unwrap(), Some(json!(1)));
+    // New commits land in segments and replay after the legacy file.
+    store.put("/new", json!(3)).unwrap();
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(store.version(), 3);
+    assert_eq!(store.get("/new").unwrap(), Some(json!(3)));
+    // A snapshot retires the legacy file along with sealed segments.
+    store.snapshot().unwrap();
+    assert!(!dir.path().join("wal.log").exists());
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(store.version(), 3);
+}
+
+#[test]
+fn snapshots_under_concurrent_writes_lose_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = open(dir.path());
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let store = store.clone();
+            s.spawn(move || {
+                for i in 0..50 {
+                    store.put(&format!("/t{t}/i{i}"), json!(i)).unwrap();
+                }
+            });
+        }
+        let store = store.clone();
+        s.spawn(move || {
+            for _ in 0..10 {
+                store.snapshot().unwrap();
+            }
+        });
+    });
+    let final_version = store.version();
+    assert_eq!(final_version, 200);
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(store.version(), final_version);
+    for t in 0..4 {
+        for i in 0..50 {
+            assert_eq!(
+                store.get(&format!("/t{t}/i{i}")).unwrap(),
+                Some(json!(i)),
+                "/t{t}/i{i} lost across snapshot + restart"
+            );
+        }
+    }
 }
 
 #[test]

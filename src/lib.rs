@@ -14,5 +14,6 @@ pub mod typed;
 pub use error::{Result, StoreError};
 pub use meta::Stamp;
 pub use model::{Node, PlainView, Pointer};
+pub use persistence::Durability;
 pub use store::{CommitInfo, Committed, Condition, Op, Store, StoreConfig};
 pub use typed::{to_node, Document, TypedMount};

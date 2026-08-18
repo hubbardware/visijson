@@ -20,8 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(dir) => Some(PathBuf::from(dir)),
         Err(_) => Some(PathBuf::from("./data")),
     };
+    // DURABILITY=sync|async|nofsync — what a write ack promises (default sync).
+    let durability = match std::env::var("DURABILITY").as_deref() {
+        Ok("async") => visijson::Durability::Async,
+        Ok("nofsync") | Ok("none") => visijson::Durability::NoFsync,
+        _ => visijson::Durability::Sync,
+    };
     let cfg = StoreConfig {
         data_dir,
+        durability,
         ..StoreConfig::default()
     };
     let store = Store::open(cfg)?;
