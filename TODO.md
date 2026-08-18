@@ -19,7 +19,21 @@ stray `GET /version` route is gone.
 Still open:
 - `/views` namespace arrives with #2.
 
-## 2. Materialized views under `/views`
+## 2. Materialized views under `/views` — deferred (2026-08-18)
+
+**Decision: do nothing yet.** Views already work today as plain formulas
+(`jq(...)` anywhere in the doc, placement by convention), and pre-#6
+there is one trusted writer and nothing to protect from anyone. The
+`/views` mount (design below, fully settled and kept for that day) is
+really an *ownership* feature — shielding consumer overlays from data
+owners' full replaces — and ownership should be decided once, alongside
+#6. The rules-based alternative ("data writes preserve formulas" /
+sticky reconcile) was considered and rejected: it breaks "what you PUT
+is what you GET", resurrects formulas producers deleted from their own
+schemas (fixable only with ownership metadata — i.e. users again), and
+doesn't address cycle geometry, which forbids in-scope placement
+regardless. Cheap crumb available any time: `GET /formulas` — a
+discovery listing (path + expression) straight off the `FormulaIndex`.
 
 A connection should be able to create its own view of the data and read it
 under `/views/...` — like a materialized view, with all the existing
@@ -298,6 +312,26 @@ cap this spun forever), with rebase on it's 20/20 at ~7.8ms each.
 
 ## 11. TUI client alongside the embedded web UI
 
+**v1 done (2026-08-18):** `tui/` (`visijson-tui`), HTTP-only ratatui
+client. Tree browser with fold/unfold and `ƒ` formula markers (from a
+raw read per snapshot), detail pane, live updates over SSE (named
+events, RFC 6902 patches applied to a local mirror, auto-reconnect with
+`Last-Event-ID` resume), and editing: `e` edits values or formulas
+(`=expr` declares a formula, bare words become strings), `a` adds
+object keys / appends to arrays, `d` deletes — every edit and delete is
+`If-Match`-guarded off a fresh raw read, so concurrent changes surface
+as a 412 conflict message instead of a lost update. `--check` gives a
+headless connect-and-print smoke mode. Verified end-to-end through a
+sized pty: rendering, formula markers, and mid-session SSE updates
+re-rendering recomputed values.
+
+Remaining polish (small, as wanted):
+- Formula markers can go stale between snapshots when *another* client
+  creates/deletes formulas (values stay live; only the ƒ badge lags).
+- Capability-driven greyout arrives with #4/#6, same as the web UI.
+- Array element insert-at-index (only append today); copy/yank.
+
+Original sketch:
 A terminal UI (ratatui or similar) speaking the same HTTP API as the
 embedded web editor (`src/ui.html`): tree browser with expand/collapse,
 inline value editing, spreadsheet-style formula editing (mirroring the

@@ -1,0 +1,13 @@
+[package]
+name = "visijson-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal client for a running visijson server: live tree browser with spreadsheet-style value and formula editing over plain HTTP + SSE"
+license = "MIT"
+
+# Deliberately not a dependency of the server crate (and vice versa): the
+# TUI speaks the HTTP API only, and ratatui/ureq must never bloat the store.
+[dependencies]
+ratatui = "0.29"
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

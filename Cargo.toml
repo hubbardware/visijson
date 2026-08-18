@@ -28,4 +28,4 @@ tempfile = "3"
 tokio-tungstenite = "0.23"
 
 [workspace]
-members = [".", "derive"]
+members = [".", "derive", "tui"]
