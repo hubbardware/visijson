@@ -4,6 +4,7 @@ pub mod formulas;
 pub mod meta;
 pub mod model;
 pub mod persistence;
+pub mod stats;
 pub mod store;
 pub mod subscriptions;
 pub mod typed;

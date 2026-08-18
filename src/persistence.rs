@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::formulas;
 use crate::meta::{ModIndex, Stamp};
+use crate::stats::Stats;
 use crate::model::{empty_object, Node};
 use crate::store::{apply_ops, Op};
 
@@ -74,6 +75,7 @@ pub struct Persistence {
     snapshot_path: PathBuf,
     wal: Mutex<BufWriter<File>>,
     fsync: bool,
+    stats: Arc<Stats>,
     /// Exclusive advisory lock on the data dir, held for the process lifetime.
     /// Two processes sharing a dir would interleave WAL versions and truncate
     /// each other's records on snapshot rotation.
@@ -81,7 +83,7 @@ pub struct Persistence {
 }
 
 impl Persistence {
-    pub fn open(dir: &Path, fsync: bool) -> Result<Self> {
+    pub fn open(dir: &Path, fsync: bool, stats: Arc<Stats>) -> Result<Self> {
         use fs2::FileExt;
         fs::create_dir_all(dir)?;
         let lock = OpenOptions::new()
@@ -105,6 +107,7 @@ impl Persistence {
             snapshot_path,
             wal: Mutex::new(BufWriter::new(file)),
             fsync,
+            stats,
             _lock: lock,
         })
     }
@@ -193,8 +196,10 @@ impl Persistence {
         let mut w = self.wal.lock().unwrap();
         writeln!(w, "{line}")?;
         w.flush()?;
+        Stats::bump(&self.stats.wal_records);
         if self.fsync {
             w.get_ref().sync_data()?;
+            Stats::bump(&self.stats.wal_fsyncs);
         }
         Ok(())
     }

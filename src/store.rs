@@ -23,6 +23,7 @@ use crate::model::{
     to_plain_value, to_raw_value, Node, Pointer,
 };
 use crate::persistence::{Persistence, WalRecord};
+use crate::stats::Stats;
 use crate::subscriptions::{CommitEvent, Hub, Pending};
 
 /// An immutable committed state: version + root of the persistent tree,
@@ -124,6 +125,7 @@ pub struct Store {
     hub: Hub,
     persistence: Option<Persistence>,
     max_retries: u32,
+    stats: Arc<Stats>,
 }
 
 /// A `Put` diff reporting more distinct paths than this collapses to the
@@ -295,9 +297,10 @@ fn check_conditions(root: &Arc<Node>, conditions: &[Condition]) -> Result<()> {
 
 impl Store {
     pub fn open(cfg: StoreConfig) -> Result<Arc<Store>> {
+        let stats = Arc::new(Stats::default());
         let rec = match &cfg.data_dir {
             Some(dir) => {
-                let p = Persistence::open(dir, cfg.fsync)?;
+                let p = Persistence::open(dir, cfg.fsync, stats.clone())?;
                 let rec = p.recover()?;
                 (Some(p), rec)
             }
@@ -316,7 +319,13 @@ impl Store {
             hub: Hub::new(committed),
             persistence,
             max_retries: cfg.max_retries,
+            stats,
         }))
+    }
+
+    /// Point-in-time operational counters.
+    pub fn stats(&self) -> crate::stats::StatsSnapshot {
+        self.stats.snapshot()
     }
 
     pub fn in_memory() -> Arc<Store> {
@@ -447,6 +456,7 @@ impl Store {
         // A commit that changed nothing (e.g. re-PUTting an identical
         // fetch) is elided entirely: no version bump, no WAL, no event.
         if changed.is_empty() && fchanged.is_empty() {
+            Stats::bump(&self.stats.elided);
             return Ok(Some(CommitInfo {
                 version: cur.version,
                 changed_paths: Vec::new(),
@@ -467,8 +477,10 @@ impl Store {
         });
         let prev = self.current.compare_and_swap(cur, next.clone());
         if !Arc::ptr_eq(&prev, cur) {
+            Stats::bump(&self.stats.cas_losses);
             return Ok(None);
         }
+        Stats::bump(&self.stats.commits);
         let changed_paths: Vec<String> = all.iter().map(|p| p.to_string()).collect();
         let pending = Pending {
             committed: next.clone(),
@@ -589,7 +601,10 @@ impl Store {
         // Publication (and thus WAL append) is locked out while we write the
         // snapshot and truncate the WAL, so the rotation point is exact.
         self.hub.with_publish_lock(|published| {
+            let t = std::time::Instant::now();
             persistence.write_snapshot(published.version, published.time_ms, &published.root)?;
+            Stats::bump(&self.stats.snapshots);
+            Stats::add(&self.stats.snapshot_micros, t.elapsed().as_micros() as u64);
             tracing::info!(version = published.version, "snapshot written");
             Ok(Some(published.version))
         })
