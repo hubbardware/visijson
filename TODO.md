@@ -63,12 +63,28 @@ diffs small.
   attach: definition writes shape-checked (must be a formula), values
   read-only, `GET /views` an enumerable registry, one ACL boundary
   later.
+- **Write model (2026-08-18):** `/views` accepts *declare* (create-only
+  PUT, shape-checked: must be a formula), *delete*, and later *renew*
+  (TTL lease) — no in-place modify, no plain data. Redefinition =
+  delete + declare; allowing PUT-over-existing later is trivial if
+  wanted (it's just a formula write).
+- **Dependency semantics — free, by construction:** view→view and doc
+  formula→view both already work (formula-on-formula reads the cached
+  value, one dependency graph, topo order within the commit, so a data
+  write updates chained views atomically); cycles across namespaces are
+  rejected by the existing detection (422). Deleting a view that others
+  reference yields the standard `#ERR: missing reference` (non-fatal,
+  heals if redeclared). Known limit: a view cannot scope the whole
+  root (`jq(/, …)` overlaps `$views` itself → cycle) — scope specific
+  subtrees.
 - **Implementation wrinkle to solve at build time:** formulas resolve
   pointers against the store root and existing doc formulas use paths
-  like `/players`, so the doc can't be nested under a key. Likely
-  shape: a reserved top-level key in the doc store's tree (e.g.
-  `$views`) that `/doc` routes hide, root-level full replaces are
-  special-cased to preserve, and `/views/...` maps onto.
+  like `/players`, so the doc can't be nested under a key — and for
+  view-referencing formulas (`/views/top10`) to resolve without
+  rewriting pointers inside expressions, the reserved top-level key
+  should literally be named `views` (client paths == tree paths; cost:
+  doc data can't use a top-level `views` key). `/doc` routes hide it;
+  root-level full replaces are special-cased to preserve it.
 
 Still open:
 - jq programs are re-compiled on each evaluation (jaq's compiled `Filter`
