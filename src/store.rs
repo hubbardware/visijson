@@ -807,7 +807,15 @@ impl Store {
         let Some(persistence) = &self.persistence else {
             return Ok(None);
         };
-        let _one_at_a_time = persistence.snapshot_guard();
+        let mut last_snapshot = persistence.snapshot_guard();
+        // Nothing committed since the last snapshot: the file on disk is
+        // already byte-equivalent, so skip the serialize/fsync/rename and
+        // the WAL segment churn entirely (an idle store's periodic tick
+        // becomes a version compare).
+        let enqueued_version = self.hub.latest_enqueued(|e| e.version);
+        if enqueued_version == *last_snapshot {
+            return Ok(Some(enqueued_version));
+        }
         let t = std::time::Instant::now();
         let (pinned, rotation) = self.hub.latest_enqueued(|enqueued| {
             let rotation = persistence.request_rotation()?;
@@ -818,6 +826,7 @@ impl Store {
             .map_err(|_| StoreError::WalBroken("WAL writer thread exited".into()))??;
         persistence.write_snapshot(pinned.version, pinned.time_ms, &pinned.root, &pinned.mods)?;
         persistence.prune(&sealed);
+        *last_snapshot = pinned.version;
         Stats::bump(&self.stats.snapshots);
         Stats::add(&self.stats.snapshot_micros, t.elapsed().as_micros() as u64);
         tracing::info!(version = pinned.version, "snapshot written");

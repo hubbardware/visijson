@@ -165,8 +165,11 @@ pub struct Persistence {
     shared: Arc<WalShared>,
     tx: Option<mpsc::Sender<WalMsg>>,
     writer: Option<std::thread::JoinHandle<()>>,
-    /// Serializes snapshots (rotation + write + prune) against each other.
-    snap_lock: Mutex<()>,
+    /// Serializes snapshots (rotation + write + prune) against each other,
+    /// and remembers the last snapshotted version so an idle store's
+    /// periodic tick skips the whole write instead of re-serializing an
+    /// identical snapshot (and churning an empty WAL segment) forever.
+    last_snapshot: Mutex<u64>,
     /// Exclusive advisory lock on the data dir, held for the process lifetime.
     /// Two processes sharing a dir would interleave WAL versions and prune
     /// each other's segments on snapshot rotation.
@@ -207,7 +210,7 @@ impl Persistence {
             }),
             tx: None,
             writer: None,
-            snap_lock: Mutex::new(()),
+            last_snapshot: Mutex::new(0),
             _lock: lock,
         })
     }
@@ -228,6 +231,9 @@ impl Persistence {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0, empty_object(), None),
                 Err(e) => return Err(e.into()),
             };
+        // Seed the idle-skip watermark: the on-disk snapshot already covers
+        // exactly this version.
+        *self.last_snapshot.lock().unwrap() = version;
         let mut index = formulas::scan_index(&root);
         // Exact validators from the snapshot when present (client ETags
         // stay valid across the restart); floor otherwise. Replay sharpens
@@ -394,8 +400,8 @@ impl Persistence {
     }
 
     /// Serialize whole-snapshot operations against each other.
-    pub fn snapshot_guard(&self) -> MutexGuard<'_, ()> {
-        self.snap_lock.lock().unwrap()
+    pub fn snapshot_guard(&self) -> MutexGuard<'_, u64> {
+        self.last_snapshot.lock().unwrap()
     }
 
     /// Atomically write a snapshot at `version` (temp file + rename). Safe

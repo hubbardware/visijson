@@ -385,6 +385,38 @@ fn rebased_commits_equal_wal_replay() {
 }
 
 #[test]
+fn idle_snapshots_are_skipped() {
+    let dir = TempDir::new().unwrap();
+    let store = open(dir.path());
+    store.put("/a", json!(1)).unwrap();
+    assert_eq!(store.snapshot().unwrap(), Some(1));
+    assert_eq!(store.stats().snapshots, 1);
+
+    // Nothing committed since: the tick is a version compare, no write.
+    assert_eq!(store.snapshot().unwrap(), Some(1));
+    // An elided commit doesn't force one either.
+    store.put("/a", json!(1)).unwrap();
+    assert_eq!(store.snapshot().unwrap(), Some(1));
+    assert_eq!(store.stats().snapshots, 1);
+
+    // A real change snapshots again.
+    store.put("/b", json!(2)).unwrap();
+    assert_eq!(store.snapshot().unwrap(), Some(2));
+    assert_eq!(store.stats().snapshots, 2);
+
+    // Recovery seeds the watermark from the on-disk snapshot, so an idle
+    // restart doesn't rewrite it once per tick either.
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(store.snapshot().unwrap(), Some(2));
+    assert_eq!(store.stats().snapshots, 0, "restart rewrote an identical snapshot");
+    // ...but WAL-replayed commits past the snapshot do trigger one.
+    store.put("/c", json!(3)).unwrap();
+    assert_eq!(store.snapshot().unwrap(), Some(3));
+    assert_eq!(store.stats().snapshots, 1);
+}
+
+#[test]
 fn snapshots_under_concurrent_writes_lose_nothing() {
     let dir = TempDir::new().unwrap();
     let store = open(dir.path());
