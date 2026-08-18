@@ -337,6 +337,44 @@ whole-store validators.
   after the snapshot lands. Recovery = snapshot + replay of newer WAL
   records (legacy `wal.log` first, then `wal/` segments in order).
 
+## Durability model: how the WAL and snapshots relate
+
+The two files do different jobs, and neither is derived from the other:
+
+- **The WAL is per-commit durability, and it's cheap.** Every commit (except
+  elided no-ops) appends one JSON line — the *effect*, not the request: a
+  20k-object full replace that changed three fields records three small ops
+  — to the current `wal/NNNNNN.log` segment. One appended line makes a
+  commit crash-safe. Left alone, though, the log would grow forever and
+  replaying it from the beginning of time would take forever.
+- **The snapshot is a checkpoint, not WAL compaction.** It never reads the
+  WAL. It serializes the *in-memory tree*: pin the current immutable root
+  by `Arc` (free), stream it to `snapshot.json.tmp` outside any lock,
+  fsync, atomically rename. Its only relationship to the WAL is
+  obsolescence — every commit up to the snapshot's version is now baked
+  into one file, so the sealed segments covering them are deleted.
+- **Recovery = snapshot + replay of the newer WAL records**, re-running
+  each commit's ops and formula evaluation. The periodic snapshot cadence
+  (`SNAPSHOT_SECS`) contributes nothing to durability — the WAL already
+  provided that — it only bounds how much replay a crash can cost and how
+  large the log can grow. An idle tick is skipped entirely (a version
+  compare), so an unchanged store never rewrites an identical snapshot.
+
+**Group commit** means shared I/O, not merged records. Each commit keeps
+its own WAL line, its own version, individually replayable in strict
+order. What concurrent commits share is the *fsync*: everything that
+queues up while the writer thread is busy with the previous batch gets
+written together under one fsync — and in `Durability::Sync` each of
+those commits still acks only after that shared fsync lands, so batching
+changes throughput, never the promise. `Store::stats()` shows it
+directly: `wal_records / wal_fsyncs` is the average batch size.
+
+Life of a write, end to end: commit CASes the root in memory → its record
+enqueues to the writer thread in version order → written (maybe alongside
+neighbors, one fsync) → the commit acks → subscribers get the event.
+Independently, every `SNAPSHOT_SECS` (if anything changed) the in-memory
+tree is checkpointed and the WAL segments it supersedes are deleted.
+
 ## Tests
 
 `cargo test` covers concurrency (racing increments, disjoint writes, torn-read

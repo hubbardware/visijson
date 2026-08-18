@@ -45,4 +45,4 @@ The repo is a three-crate workspace: the store, `derive/` (`visijson-derive`, th
 
 Planned directions (URL namespaces, materialized views, permissions) are in `TODO.md` — check it before proposing structural changes.
 
-Integration tests in `tests/` lean on `Store::in_memory()` and `shares_subtree` (structural-sharing assertions); persistence tests use `tempfile`. The README's "Consistency model" section is the authoritative prose description of the ordering guarantees — keep it in sync if you change the pipeline.
+Integration tests in `tests/` lean on `Store::in_memory()` and `shares_subtree` (structural-sharing assertions); persistence tests use `tempfile`. The README's "Consistency model" and "Durability model" sections are the authoritative prose descriptions of the ordering guarantees and the WAL/snapshot relationship (the snapshot serializes the in-memory tree and is never derived from the WAL; group commit shares fsyncs, never merges records) — keep them in sync if you change the pipeline.
