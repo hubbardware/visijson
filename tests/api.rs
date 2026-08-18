@@ -611,22 +611,27 @@ async fn websocket_merge_patch_format() {
 
 /// Pull the next real SSE event (id + JSON data) off a streaming response,
 /// skipping keep-alive comment frames.
-async fn next_sse(resp: &mut reqwest::Response, buf: &mut String) -> (u64, Value) {
+/// Next SSE frame as (id, event name, payload). Every data frame is named
+/// (`event: snapshot` or `event: change`).
+async fn next_sse(resp: &mut reqwest::Response, buf: &mut String) -> (u64, String, Value) {
     loop {
         if let Some(pos) = buf.find("\n\n") {
             let frame = buf[..pos].to_string();
             buf.replace_range(..pos + 2, "");
             let mut id = None;
+            let mut name = None;
             let mut data = None;
             for line in frame.lines() {
                 if let Some(v) = line.strip_prefix("id:") {
                     id = Some(v.trim().parse::<u64>().unwrap());
+                } else if let Some(v) = line.strip_prefix("event:") {
+                    name = Some(v.trim().to_string());
                 } else if let Some(v) = line.strip_prefix("data:") {
                     data = Some(serde_json::from_str::<Value>(v.trim()).unwrap());
                 }
             }
             if let (Some(i), Some(d)) = (id, data) {
-                return (i, d);
+                return (i, name.expect("data frame without an event name"), d);
             }
             continue; // comment-only keep-alive frame
         }
@@ -655,7 +660,8 @@ async fn sse_snapshot_then_filtered_changes() {
         .starts_with("text/event-stream"));
 
     let mut buf = String::new();
-    let (snap_id, snap) = next_sse(&mut resp, &mut buf).await;
+    let (snap_id, kind, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "snapshot");
     assert_eq!(snap["type"], "snapshot");
     assert_eq!(snap["value"], json!({"n": 0}));
     assert_eq!(snap_id, snap["version"].as_u64().unwrap());
@@ -664,10 +670,11 @@ async fn sse_snapshot_then_filtered_changes() {
     store.put("/w/n", json!(1)).unwrap();
     store.put("/w/n", json!(2)).unwrap();
 
-    let (id1, ev1) = next_sse(&mut resp, &mut buf).await;
+    let (id1, kind, ev1) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "change");
     assert_eq!(ev1["patch"], json!([{"op": "replace", "path": "/n", "value": 1}]));
     assert!(id1 > snap_id);
-    let (id2, ev2) = next_sse(&mut resp, &mut buf).await;
+    let (id2, _, ev2) = next_sse(&mut resp, &mut buf).await;
     assert_eq!(ev2["patch"], json!([{"op": "replace", "path": "/n", "value": 2}]));
     assert!(id2 > id1);
 }
@@ -798,13 +805,15 @@ async fn snapshot_distinguishes_absent_from_null() {
         .await
         .unwrap();
     let mut buf = String::new();
-    let (_, snap) = next_sse(&mut resp, &mut buf).await;
+    let (_, kind, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "snapshot");
     assert_eq!(snap["exists"], json!(false));
     assert_eq!(snap["value"], json!(null));
 
     // Watch-then-create: the birth of the path arrives as an add.
     store.put("/nothing", json!({"a": 1})).unwrap();
-    let (_, ev) = next_sse(&mut resp, &mut buf).await;
+    let (_, kind, ev) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "change");
     assert_eq!(ev["patch"], json!([{"op": "add", "path": "", "value": {"a": 1}}]));
 
     // A path explicitly set to JSON null exists.
@@ -816,7 +825,7 @@ async fn snapshot_distinguishes_absent_from_null() {
         .await
         .unwrap();
     let mut buf = String::new();
-    let (_, snap) = next_sse(&mut resp, &mut buf).await;
+    let (_, _, snap) = next_sse(&mut resp, &mut buf).await;
     assert_eq!(snap["exists"], json!(true));
     assert_eq!(snap["value"], json!(null));
 }
@@ -835,11 +844,13 @@ async fn sse_merge_patch_via_accept_parameter() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let mut buf = String::new();
-    let (_, snap) = next_sse(&mut resp, &mut buf).await;
+    let (_, kind, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "snapshot");
     assert_eq!(snap["type"], "snapshot");
 
     store.put("/w", json!({"a": 2})).unwrap();
-    let (_, ev) = next_sse(&mut resp, &mut buf).await;
+    let (_, kind, ev) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "change");
     assert_eq!(ev["merge"], json!({"a": 2, "gone": null}));
 
     // Unknown patch parameter → 400 before any stream starts.

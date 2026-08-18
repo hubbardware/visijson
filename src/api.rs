@@ -17,9 +17,10 @@
 //! GET on a document path is fully content-negotiated: a WebSocket upgrade
 //! subscribes to that path (snapshot, then ordered changes — event format
 //! chosen by `Sec-WebSocket-Protocol: json-patch` (default) or
-//! `merge-patch`); `Accept: text/event-stream` subscribes over SSE (same
-//! events; format via an Accept parameter, `text/event-stream;patch=
-//! merge-patch`); an Accept preferring text/html gets the embedded UI;
+//! `merge-patch`); `Accept: text/event-stream` subscribes over SSE — named
+//! frames, `event: snapshot` / `event: change`, matching the WS `type`
+//! field; format via an Accept parameter, `text/event-stream;patch=
+//! merge-patch` — an Accept preferring text/html gets the embedded UI;
 //! everything else gets JSON.
 
 use std::sync::Arc;
@@ -799,14 +800,19 @@ fn sse_request(headers: &HeaderMap) -> Option<Result<PatchFormat, StoreError>> {
     None
 }
 
-/// Subscribe over Server-Sent Events: one unnamed `data:` frame per message,
-/// identical payloads to the WebSocket transport, with the commit version as
-/// the SSE event id. Lag resyncs with a fresh snapshot, exactly like the
-/// WebSocket path.
+/// Subscribe over Server-Sent Events: one **named** frame per message —
+/// `event: snapshot` (initial state, and resyncs, which additionally carry
+/// `"resync": true` in the payload) or `event: change` — with payloads
+/// identical to the WebSocket transport (whose `type` field uses the same
+/// names) and the commit version as the SSE event id. Consume with
+/// `EventSource.addEventListener("snapshot" | "change", ...)`; named events
+/// do not fire `onmessage`. Lag resyncs with a fresh snapshot, exactly like
+/// the WebSocket path.
 fn subscribe_sse(store: Arc<Store>, path: String, format: PatchFormat) -> ApiResult {
     let ptr = Pointer::parse(&path)?;
     let (snapshot, rx) = store.subscribe();
     let first = Event::default()
+        .event("snapshot")
         .id(snapshot.version.to_string())
         .data(snapshot_msg(snapshot.version, &snapshot.root, &ptr, false).to_string());
 
@@ -834,7 +840,10 @@ fn subscribe_sse(store: Arc<Store>, path: String, format: PatchFormat) -> ApiRes
                     let msg = change_msg(ctx.format, &ctx.ptr, &ctx.last_root, &ev);
                     ctx.last_root = ev.committed.root.clone();
                     if let Some(msg) = msg {
-                        let e = Event::default().id(ev.version.to_string()).data(msg.to_string());
+                        let e = Event::default()
+                            .event("change")
+                            .id(ev.version.to_string())
+                            .data(msg.to_string());
                         return Some((Ok(e), (ctx, None)));
                     }
                 }
@@ -844,6 +853,7 @@ fn subscribe_sse(store: Arc<Store>, path: String, format: PatchFormat) -> ApiRes
                     ctx.rx = rx;
                     ctx.last_root = snap.root.clone();
                     let e = Event::default()
+                        .event("snapshot")
                         .id(snap.version.to_string())
                         .data(snapshot_msg(snap.version, &snap.root, &ctx.ptr, true).to_string());
                     return Some((Ok(e), (ctx, None)));

@@ -63,12 +63,25 @@ Still open:
 
 ## 3. Type out the SSE `event:` field
 
-SSE frames are currently unnamed (so `EventSource.onmessage` just works)
-and the payload carries `"type": "snapshot" | "change"` inside the JSON,
-mirroring the WebSocket messages. Later: formalize a taxonomy of named
-`event:` types (`snapshot`, `change`, maybe `error`/`resync`) so clients
-can `addEventListener` per type, document it, and keep the WS `type` field
-and SSE `event:` names in sync.
+**Done (2026-08-18):** SSE frames are named — `event: snapshot` /
+`event: change` — so clients `addEventListener` per type instead of
+switching on the payload's `type` field (which stays, for parity with the
+WebSocket messages; the two must grow new names in lockstep). Resyncs are
+deliberately `snapshot`, not a separate name: a client listening for
+snapshots must never miss one, and the payload's `"resync": true` flag
+distinguishes them. Breaking change for `onmessage` consumers (named
+events don't fire it) — accepted, pre-users.
+
+Still open:
+- **Honor `Last-Event-ID` on SSE reconnect.** `EventSource` auto-reconnects
+  and sends the last `id:` it saw — which is a commit version. Today a
+  reconnect always gets a full snapshot; a client that's nearly current
+  could instead be resumed with just the missed changes (diff the
+  reconnecting version's... we don't retain old roots by version, but the
+  current head diffed against nothing requires a snapshot — the cheap
+  win is: if `Last-Event-ID` == current published version, send no
+  snapshot at all, just the live stream; anything older falls back to a
+  `snapshot` with `"resync": true`).
 
 ## 4. UI: grey out edit controls where the user can't write
 
