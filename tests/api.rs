@@ -680,6 +680,72 @@ async fn sse_snapshot_then_filtered_changes() {
 }
 
 #[tokio::test]
+async fn sse_reconnect_resumes_without_snapshot_when_current() {
+    let (base, store, _info) = serve().await;
+    store.put("/w", json!({"n": 0})).unwrap();
+    let client = reqwest::Client::new();
+
+    // First connect: normal snapshot; remember its id.
+    let mut resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let mut buf = String::new();
+    let (seen_id, kind, _) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "snapshot");
+    drop(resp); // connection lost
+
+    // Unrelated churn elsewhere advances the head but not /w.
+    store.put("/elsewhere", json!(1)).unwrap();
+    store.put("/elsewhere", json!(2)).unwrap();
+
+    // Reconnect with Last-Event-ID: /w is untouched since, so no snapshot
+    // — the very first frame is the next live change.
+    let mut resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream")
+        .header("last-event-id", seen_id.to_string())
+        .send()
+        .await
+        .unwrap();
+    store.put("/w/n", json!(1)).unwrap();
+    let mut buf = String::new();
+    let (id, kind, ev) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "change", "resumable reconnect must not resend a snapshot");
+    assert_eq!(ev["patch"], json!([{"op": "replace", "path": "/n", "value": 1}]));
+    assert!(id > seen_id);
+    drop(resp);
+
+    // Reconnect after /w itself changed: falls back to a resync snapshot.
+    let mut resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream")
+        .header("last-event-id", seen_id.to_string())
+        .send()
+        .await
+        .unwrap();
+    let mut buf = String::new();
+    let (_, kind, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "snapshot");
+    assert_eq!(snap["resync"], json!(true));
+    assert_eq!(snap["value"], json!({"n": 1}));
+
+    // A fresh connect (no Last-Event-ID) is a plain snapshot, not a resync.
+    let mut resp = client
+        .get(format!("{base}/doc/w"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    let mut buf = String::new();
+    let (_, kind, snap) = next_sse(&mut resp, &mut buf).await;
+    assert_eq!(kind, "snapshot");
+    assert_eq!(snap.get("resync"), None);
+}
+
+#[tokio::test]
 async fn conditional_gets_with_etag_and_if_modified_since() {
     let (base, store, _info) = serve().await;
     store.put("/a", json!({"n": 1})).unwrap();

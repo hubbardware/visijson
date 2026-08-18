@@ -162,7 +162,13 @@ async fn get_path(
 async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -> ApiResult {
     // `Accept: text/event-stream` subscribes over SSE instead of reading.
     if let Some(format) = sse_request(&headers) {
-        return subscribe_sse(store, ptr, format?);
+        // EventSource reconnects with the last event id it saw — a commit
+        // version — letting a current client resume without a snapshot.
+        let last_seen = headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        return subscribe_sse(store, ptr, format?, last_seen);
     }
     // Browsers get the live UI for any path — even one that doesn't exist
     // yet, so you can navigate somewhere and create it. `?raw=true` stays
@@ -808,13 +814,33 @@ fn sse_request(headers: &HeaderMap) -> Option<Result<PatchFormat, StoreError>> {
 /// `EventSource.addEventListener("snapshot" | "change", ...)`; named events
 /// do not fire `onmessage`. Lag resyncs with a fresh snapshot, exactly like
 /// the WebSocket path.
-fn subscribe_sse(store: Arc<Store>, path: String, format: PatchFormat) -> ApiResult {
+///
+/// `last_seen` (the reconnect's `Last-Event-ID`) resumes without any
+/// snapshot when the modification index proves the subscribed subtree is
+/// untouched since that version — the client is already current, so the
+/// stream just continues. The index only over-estimates, so a false
+/// "changed" merely downgrades to what any unresumable reconnect gets: a
+/// fresh snapshot marked `"resync": true`.
+fn subscribe_sse(
+    store: Arc<Store>,
+    path: String,
+    format: PatchFormat,
+    last_seen: Option<u64>,
+) -> ApiResult {
     let ptr = Pointer::parse(&path)?;
     let (snapshot, rx) = store.subscribe();
-    let first = Event::default()
-        .event("snapshot")
-        .id(snapshot.version.to_string())
-        .data(snapshot_msg(snapshot.version, &snapshot.root, &ptr, false).to_string());
+    let still_current = last_seen.is_some_and(|v| {
+        v <= snapshot.version && snapshot.mods.last_modified(&ptr).version <= v
+    });
+    let first = (!still_current).then(|| {
+        Event::default()
+            .event("snapshot")
+            .id(snapshot.version.to_string())
+            .data(
+                snapshot_msg(snapshot.version, &snapshot.root, &ptr, last_seen.is_some())
+                    .to_string(),
+            )
+    });
 
     struct Ctx {
         store: Arc<Store>,
@@ -830,7 +856,7 @@ fn subscribe_sse(store: Arc<Store>, path: String, format: PatchFormat) -> ApiRes
         rx,
         last_root: snapshot.root.clone(),
     };
-    let stream = futures_util::stream::unfold((ctx, Some(first)), |(mut ctx, queued)| async move {
+    let stream = futures_util::stream::unfold((ctx, first), |(mut ctx, queued)| async move {
         if let Some(ev) = queued {
             return Some((Ok::<_, std::convert::Infallible>(ev), (ctx, None)));
         }

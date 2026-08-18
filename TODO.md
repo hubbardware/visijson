@@ -72,28 +72,24 @@ snapshots must never miss one, and the payload's `"resync": true` flag
 distinguishes them. Breaking change for `onmessage` consumers (named
 events don't fire it) — accepted, pre-users.
 
-Still open:
-- **Honor `Last-Event-ID` on SSE reconnect** (design settled 2026-08-18).
-  `EventSource` auto-reconnects sending the last `id:` it saw — a commit
-  version V. No patch log is needed: patches are computed by diffing
-  roots, so resuming needs only *old roots*, which structural sharing
-  makes cheap (and the broadcast ring already pins the last ~1024
-  `Arc<Committed>`s anyway). Three-rung ladder, each degrading safely to
-  the next:
-  1. `mods.last_modified(ptr).version <= V` → subtree untouched since the
-     client left: send nothing, resume the live stream. Zero retention,
-     covers the common quiet-reconnect case, kills the reconnect
-     snapshot herd. Over-estimation just falls through to rung 2/3.
-  2. Root@V still retained (small `VecDeque<(version, Arc<Committed>)>`
-     in the Hub, trimmed by count/age — near-zero extra memory since the
-     Arcs are shared with the broadcast ring) → one *coalesced* catch-up
-     `change` patch diffing root@V vs current at ptr, then stream.
-     Watch the retention bound: a big replace pins its displaced subtree
-     until it ages out.
-  3. Otherwise → today's `snapshot` with `"resync": true` (always
-     correct; retention is purely an optimization dial).
-  Implement 1+3 first; add the ring only if reconnect-under-heavy-writes
-  shows up as a real cost.
+**`Last-Event-ID` resume (rungs 1+3) done (2026-08-18):** an SSE
+reconnect carries the last `id:` the client saw — a commit version V. If
+the modification index proves the subscribed subtree is untouched since V
+(`last_modified(ptr).version <= V`), the stream resumes with **no
+snapshot at all** — zero retention, and it kills the reconnect snapshot
+herd for quiet subtrees. Otherwise the reconnect gets a fresh snapshot
+marked `"resync": true` (a fresh connect's snapshot stays unmarked).
+Over-estimation only ever downgrades a resume to a resync.
+
+Still open, purely an optimization (add only if reconnect-under-heavy-
+writes shows up as a measured cost):
+- **Rung 2 — coalesced catch-up.** Retain recent roots (small
+  `VecDeque<(version, Arc<Committed>)>` in the Hub, trimmed by count/age
+  — near-zero extra memory, the broadcast ring already pins the last
+  ~1024 `Arc<Committed>`s) and, when root@V is retained, send one
+  coalesced `change` patch diffing root@V vs current at ptr instead of a
+  resync snapshot. Watch the retention bound: a big replace pins its
+  displaced subtree until it ages out.
 
 ## 4. UI: grey out edit controls where the user can't write
 
