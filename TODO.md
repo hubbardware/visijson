@@ -247,8 +247,9 @@ Design notes:
   client); if a reusable client-side helper emerges, consider sharing it
   with future client work rather than burying it in the TUI.
 
-Worth deciding when picking it up: whether it talks HTTP only (works
-against any running server, the honest client story) or can also open a
-data dir directly in-process (handy for offline inspection of snapshots
-and WAL segments, but must respect the `LOCK` file semantics — a second
-process on the same dir fails to start by design).
+**Decided (2026-08-18): HTTP only** — it works against any running
+server and keeps the client story honest. (In-process data-dir opening
+for offline snapshot/WAL inspection was considered and dropped; if that
+need arises it's a separate inspection tool, and it would have to respect
+the `LOCK` file semantics — a second process on the same dir fails to
+start by design.)
