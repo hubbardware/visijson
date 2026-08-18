@@ -161,30 +161,30 @@ the throughput half.
 
 ## 9. Write throughput: get I/O off the critical path
 
-- **WAL fsync runs inline inside the publication mutex** (subscriptions.rs:68
-  → persistence.rs:192-201), on a tokio worker, one fsync per commit, no
-  batching. Move it to a dedicated writer thread fed by a channel, with
-  group commit. Keep the channel send *inside* the mutex so WAL order ==
-  version order still holds; only the I/O leaves. `Durability::{Sync,
-  Async, NoFsync}`, default `Sync` — concurrent writers share one fsync but
-  a commit still returns only once its own record is durable, preserving
-  the ack-implies-written guarantee and fail-stop from #8.
-- **Snapshots hold the publication lock across whole-document serialize +
-  `sync_all` + rename + WAL truncate**, stalling every commit *and every new
-  subscriber connection* (`Hub::subscribe` shares the mutex) for a duration
-  proportional to document size. Take the `Arc` under the lock, enqueue a
-  WAL rotate, serialize outside; needs WAL segmentation (`wal/000001.log`,
-  keeping legacy `wal.log` readable) so old segments drop after the rename.
-- **Every write handler calls `Store::commit` from `async fn`**
-  (api.rs:199-330), and the snapshot ticker from a bare `tokio::spawn` — a
-  400ms PUT blocks a tokio worker today, before fsync is even involved.
-  `spawn_blocking` is the cheapest latency win available.
+**Done (2026-08-18)**, in three commits:
+- `Store::stats()` counters + `examples/bench_write.rs` (writers ×
+  durability × formula workload; reports CAS losses and records/fsync).
+- Dedicated WAL writer thread with group commit: records enqueue under
+  the publication mutex (channel order == version order), the writer
+  batches everything queued during the previous write into one fsync, and
+  broadcasts via `Hub::publish_batch` only after a batch reaches its
+  durability level. `Durability::{Sync, Async, NoFsync}` (default Sync;
+  `DURABILITY` env var); ack-implies-durable and #8's fail-stop preserved.
+  Snapshots pin the enqueued `Committed` + enqueue a segment rotation
+  under the lock, serialize/rename outside it, prune sealed segments
+  after; WAL is now `wal/NNNNNN.log` segments, legacy `wal.log` replayed
+  first and retired by the next snapshot.
+- `spawn_blocking` around all eight write handlers and the snapshot tick.
 
-Prerequisite for all of it: **we have no write-throughput measurement.**
-`examples/bench_diff.rs` is single-threaded and in-memory, so fsync never
-runs. Need stats counters (commits, CAS losses, fsyncs vs records, snapshot
-micros) and `examples/bench_write.rs` sweeping writers × durability ×
-formula count × contention.
+Measured (8 writers): Sync 270 → 1041 ops/s (4 rec/fsync; p50 30ms →
+7.7ms), Async 2080 ops/s (8 rec/fsync). Known costs / future tuning:
+- NoFsync pays ~5µs/commit for the writer-thread handoff (single-writer
+  151k → 85k ops/s). Could special-case an inline write path if it matters.
+- Single-writer Async is still fsync-bound (~260 ops/s): serial commits
+  queue behind the previous batch's fsync inside the one writer thread.
+  A two-stage pipeline (fsync on its own thread) would fix it.
+- Batches form from wake-up stragglers (4 rec/fsync at 8 writers, not 8);
+  a tiny gather window before writing would trade p50 for throughput.
 
 ## 10. Commit rebase on CAS loss
 

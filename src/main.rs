@@ -45,8 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await; // first tick is immediate; skip it
             loop {
                 interval.tick().await;
-                if let Err(e) = snap_store.snapshot() {
-                    tracing::error!(error = %e, "periodic snapshot failed");
+                // Serializing a large document is CPU-bound; keep it off
+                // the async workers.
+                let s = snap_store.clone();
+                match tokio::task::spawn_blocking(move || s.snapshot()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::error!(error = %e, "periodic snapshot failed"),
+                    Err(e) => tracing::error!(error = %e, "snapshot task failed"),
                 }
             }
         });

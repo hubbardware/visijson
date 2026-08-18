@@ -196,8 +196,19 @@ async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -
 
 // Bodies deserialize straight into `Node` trees (no intermediate Value).
 
+/// Commits block: preparation (path-copy, diff) can run hundreds of ms for
+/// large documents and `Durability::Sync` waits on an fsync — neither may
+/// pin a tokio worker.
+async fn commit_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, StoreError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| StoreError::Io(std::io::Error::other(format!("commit task: {e}"))))?
+}
+
 async fn put_root(State(store): State<Arc<Store>>, Json(node): Json<Node>) -> ApiResult {
-    Ok(Json(store.put_node("", Arc::new(node))?).into_response())
+    Ok(Json(commit_blocking(move || store.put_node("", Arc::new(node))).await?).into_response())
 }
 
 async fn put_path(
@@ -205,13 +216,14 @@ async fn put_path(
     Path(path): Path<String>,
     Json(node): Json<Node>,
 ) -> ApiResult {
-    Ok(Json(store.put_node(&pointer_of(&path), Arc::new(node))?).into_response())
+    let ptr = pointer_of(&path);
+    Ok(Json(commit_blocking(move || store.put_node(&ptr, Arc::new(node))).await?).into_response())
 }
 
 // ------------------------------------------------------------------ POST (append)
 
 async fn post_root(State(store): State<Arc<Store>>, Json(node): Json<Node>) -> ApiResult {
-    Ok(Json(store.append_node("", Arc::new(node))?).into_response())
+    Ok(Json(commit_blocking(move || store.append_node("", Arc::new(node))).await?).into_response())
 }
 
 async fn post_path(
@@ -219,17 +231,22 @@ async fn post_path(
     Path(path): Path<String>,
     Json(node): Json<Node>,
 ) -> ApiResult {
-    Ok(Json(store.append_node(&pointer_of(&path), Arc::new(node))?).into_response())
+    let ptr = pointer_of(&path);
+    Ok(
+        Json(commit_blocking(move || store.append_node(&ptr, Arc::new(node))).await?)
+            .into_response(),
+    )
 }
 
 // ------------------------------------------------------------------ DELETE
 
 async fn delete_root(State(store): State<Arc<Store>>) -> ApiResult {
-    Ok(Json(store.remove("")?).into_response())
+    Ok(Json(commit_blocking(move || store.remove("")).await?).into_response())
 }
 
 async fn delete_path(State(store): State<Arc<Store>>, Path(path): Path<String>) -> ApiResult {
-    Ok(Json(store.remove(&pointer_of(&path))?).into_response())
+    let ptr = pointer_of(&path);
+    Ok(Json(commit_blocking(move || store.remove(&ptr)).await?).into_response())
 }
 
 // ------------------------------------------------------------------ PATCH
@@ -311,9 +328,9 @@ async fn apply_patch(
     if is_json_patch {
         let patch: Vec<PatchOp> = serde_json::from_value(body).map_err(StoreError::Serde)?;
         let (ops, conditions) = patch_to_ops(&prefix, patch)?;
-        Ok(Json(store.commit(ops, &conditions)?).into_response())
+        Ok(Json(commit_blocking(move || store.commit(ops, &conditions)).await?).into_response())
     } else {
-        Ok(Json(store.merge(&prefix, body)?).into_response())
+        Ok(Json(commit_blocking(move || store.merge(&prefix, body)).await?).into_response())
     }
 }
 
@@ -328,7 +345,10 @@ struct TxnRequest {
 }
 
 async fn txn_handler(State(store): State<Arc<Store>>, Json(req): Json<TxnRequest>) -> ApiResult {
-    Ok(Json(store.commit(req.ops, &req.conditions)?).into_response())
+    Ok(
+        Json(commit_blocking(move || store.commit(req.ops, &req.conditions)).await?)
+            .into_response(),
+    )
 }
 
 // ------------------------------------------------------------------ /version
