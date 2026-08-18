@@ -38,9 +38,10 @@ Still open:
   the document; `/views` should mount view definitions outside user data,
   read-only, probably per-connection or named.
 - Lifetime: tied to the creating connection, or persistent until deleted?
-- jq programs are re-parsed on each evaluation. Formula ASTs are worse —
-  see #7, which supersedes the AST half of this note; cache compiled jq
-  programs keyed by expression text alongside it.
+- jq programs are re-compiled on each evaluation (jaq's compiled `Filter`
+  borrows its `Arena`/`Loader`, so caching it is a lifetime puzzle). The
+  formula-AST half of this note was fixed by #7; jq compile caching
+  remains.
 - ~~Get under the ~300ms full-replace floor~~ — done 2026-08-06, all three
   rungs: (1) `Node` deserializes straight from JSON (no `Value`) and ops
   carry `Arc<Node>`; (2) `typed::to_node` + `Store::put_typed` serialize
@@ -115,28 +116,26 @@ optimizations. Full assessment:
 
 ## 7. Formula evaluation is O(F²) per commit attempt
 
-`formulas::reevaluate` (formulas.rs:552-607) materializes entries for
-**every** formula in the document, re-parses every formula's expression
-text, and builds the whole dependency graph with a double loop — *before*
-narrowing to the dirty set at line 611. A document with F formulas pays
-`O(F·parse + F²·overlap)` on every commit attempt **even when the commit
-touches no formula**. For a spreadsheet-like workload this is the
-scalability ceiling. The `Committed.formulas` index made formula-free
-documents free (125ns); it did nothing for formula-*ful* ones.
+**Done (2026-08-17):** `Committed.formulas` is now `formulas::FormulaIndex`
+— two `imbl::OrdMap`s (formula path → `Arc<FormulaInfo>` with the parsed
+AST and deduped deps; dep pointer → dependent formula paths). Overlap
+queries are `depth` ancestor point-lookups + one `OrdMap::range` descendant
+scan (token-vector `Ord` keeps descendants contiguous). `reevaluate` seeds
+the dirty set from changed paths, BFSes the closure over reverse edges,
+builds the graph over the dirty subgraph only, and topo-sorts with
+iterative Kahn (no recursion). Expressions parse once, in `update_index`,
+when a formula enters or changes — identical re-PUTs reuse the old
+`Arc<FormulaInfo>`. Bench (20k×110 doc + 1k formulas): unrelated
+single-field PUT 3.25ms → 25µs; `reevaluate` with 0 dirty 2.6ms → 1.9µs.
 
-Fix: replace `BTreeSet<Pointer>` with an index carrying `dep-pointer →
-dependent formulas` plus cached parsed ASTs, both `imbl` persistent maps
-like `meta::ModIndex`. Overlap queries decompose into `depth` ancestor
-point-lookups plus one `OrdMap::range` descendant scan, so cost becomes
-proportional to the dirty set: seed from changed paths, BFS the transitive
-closure over reverse edges, build the graph over the dirty subgraph only.
-Also make the topo DFS iterative — it currently recurses over F and will
-overflow the stack at scale.
-
-One semantic narrowing to document and test: a *pre-existing* cycle in an
-untouched region would stop rejecting unrelated commits. Newly formed
-cycles are still rejected — any new cycle must include a formula whose path
-or expression this commit wrote, so it is always reachable from the seed.
+Documented narrowings (both only reachable via a foreign snapshot — live
+commits reject cycles and parse errors at creation): a *pre-existing*
+cycle or unparseable formula in an untouched region no longer rejects
+unrelated commits (`scan_index` skips unparseable formulas with a warning
+at recovery). Newly formed cycles are still rejected — any new cycle
+includes a formula this commit wrote, so it is always seeded. Pinned by
+`preexisting_cycle_only_rejects_commits_that_touch_it` (unit) and
+`foreign_snapshot_cycle_only_rejects_commits_that_touch_it` (integration).
 
 ## 8. Durability defects
 
@@ -186,11 +185,15 @@ precisely in the mixed workload (a big periodic sync alongside small
 concurrent writes).
 
 Instead of partitioning the tree by "owner" threads: when we lose to
-exactly one commit, and our ops are `Put`/`Merge` only, and the winner's
-changed paths don't `Pointer::overlaps` any of our scan roots, and no
-formulas are implicated on either side (needs #7's query to be cheap),
-splice the already-built subtree `Arc` onto the new root via `set_at` and
-reuse the computed changed paths. Microseconds instead of a full replay.
+exactly one commit, and our ops are `Put`/`Merge` only, and the winner
+didn't touch our subtree, and no formulas are implicated on either side
+(#7's `FormulaIndex` queries make that check cheap), splice the
+already-built subtree `Arc` onto the new root via `set_at` and reuse the
+computed changed paths. Microseconds instead of a full replay. The
+"winner didn't touch it" check can be `Arc::ptr_eq` on the node at each of
+our scan roots between the base root and the winner's root — structural
+sharing means an untouched subtree is literally the same pointer, which is
+both free and impossible to over-approximate (idea 2026-08-17).
 
 Flag-gated, off by default until a randomized test proves rebased trees
 equal full WAL replay (`nodes_equal`) — WAL replay is an independent

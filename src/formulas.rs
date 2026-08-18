@@ -22,9 +22,11 @@
 //! On every commit, formulas whose dependencies overlap the changed paths are
 //! re-evaluated in topological order; cycles reject the commit.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
+use imbl::{OrdMap, OrdSet};
 use serde_json::{Number, Value};
 
 use crate::error::{Result, StoreError};
@@ -458,25 +460,169 @@ fn num_to_value(n: f64) -> std::result::Result<Value, String> {
 
 // ------------------------------------------------- commit-time re-evaluation
 
-struct FormulaEntry {
-    path: Pointer,
-    expr: String,
-    ast: Expr,
-    deps: Vec<Pointer>,
-    cached: Arc<Node>,
+/// Everything known about one formula, parsed once when it entered the
+/// index and shared by pointer until its expression text changes.
+#[derive(Debug)]
+pub struct FormulaInfo {
+    pub expr: String,
+    pub ast: Expr,
+    /// Declared dependency pointers, sorted and deduplicated.
+    pub deps: Vec<Pointer>,
 }
 
-/// Scan the entire tree for formula locations. Used once per store open /
-/// recovery; per-commit maintenance goes through `update_index`.
-pub fn scan_index(root: &Arc<Node>) -> BTreeSet<Pointer> {
-    let mut index = BTreeSet::new();
+/// Persistent index of formula locations and their dependency edges,
+/// carried in every `Committed` like `meta::ModIndex`: O(1) clone, path-copy
+/// updates. Unlike `ModIndex` it is *exact* live state — no floor and no
+/// entry-cap collapse are possible, because there is no safe over-estimate;
+/// size is bounded by the formulas actually in the document.
+#[derive(Debug, Clone, Default)]
+pub struct FormulaIndex {
+    /// formula path → its parsed info.
+    formulas: OrdMap<Pointer, Arc<FormulaInfo>>,
+    /// dependency pointer (as declared in some formula) → the formula
+    /// paths that declare it.
+    rev: OrdMap<Pointer, OrdSet<Pointer>>,
+}
+
+impl FormulaIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.formulas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.formulas.is_empty()
+    }
+
+    pub fn get(&self, p: &Pointer) -> Option<&Arc<FormulaInfo>> {
+        self.formulas.get(p)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Pointer, &Arc<FormulaInfo>)> {
+        self.formulas.iter()
+    }
+
+    fn insert(&mut self, path: Pointer, info: Arc<FormulaInfo>) {
+        for d in &info.deps {
+            self.rev.entry(d.clone()).or_default().insert(path.clone());
+        }
+        self.formulas.insert(path, info);
+    }
+
+    fn remove(&mut self, path: &Pointer) {
+        let Some(info) = self.formulas.remove(path) else {
+            return;
+        };
+        for d in &info.deps {
+            let now_empty = match self.rev.get_mut(d) {
+                Some(set) => {
+                    set.remove(path);
+                    set.is_empty()
+                }
+                None => false,
+            };
+            if now_empty {
+                self.rev.remove(d);
+            }
+        }
+    }
+
+    /// Formulas made dirty by a change at `c`: own path overlaps `c` (a
+    /// subtree replace must dirty every formula under it) or some declared
+    /// dependency overlaps `c`.
+    fn affected_by(&self, c: &Pointer, out: &mut BTreeSet<Pointer>) {
+        overlapping(&self.formulas, c, |k, _| {
+            out.insert(k.clone());
+        });
+        overlapping(&self.rev, c, |_, dependents| {
+            for f in dependents {
+                out.insert(f.clone());
+            }
+        });
+    }
+
+    /// Formulas with a declared dependency overlapping formula path `f` —
+    /// the reverse dependency edge.
+    fn dependents_of(&self, f: &Pointer, out: &mut BTreeSet<Pointer>) {
+        overlapping(&self.rev, f, |_, dependents| {
+            for p in dependents {
+                out.insert(p.clone());
+            }
+        });
+    }
+}
+
+/// Entries of `map` whose key is a strict descendant of `p`. Descendants
+/// are contiguous after `p` because `Pointer` orders element-wise over its
+/// token vector (`["a"] < ["a","b"] < ["ab"]`), so one range scan suffices.
+fn descendants<'a, V>(
+    map: &'a OrdMap<Pointer, V>,
+    p: &'a Pointer,
+) -> impl Iterator<Item = (&'a Pointer, &'a V)> {
+    map.range::<_, Pointer>((Bound::Excluded(p), Bound::Unbounded))
+        .take_while(move |(k, _)| p.is_prefix_of(k))
+}
+
+/// Visit entries of `map` whose key overlaps `p`: one point-lookup per
+/// prefix of `p` (root and `p` itself included) plus one descendant range
+/// scan — O(depth · log n + hits) instead of a full scan.
+fn overlapping<V>(map: &OrdMap<Pointer, V>, p: &Pointer, mut f: impl FnMut(&Pointer, &V)) {
+    let mut prefix = Pointer::root();
+    if let Some(v) = map.get(&prefix) {
+        f(&prefix, v);
+    }
+    for tok in p.tokens() {
+        prefix = prefix.push(tok.clone());
+        if let Some(v) = map.get(&prefix) {
+            f(&prefix, v);
+        }
+    }
+    for (k, v) in descendants(map, p) {
+        f(k, v);
+    }
+}
+
+/// Parse an expression into index form (deps sorted + deduplicated).
+fn parse_info(expr: &str) -> Result<FormulaInfo> {
+    let ast = parse(expr)?;
+    let mut deps = dependencies(&ast);
+    deps.sort();
+    deps.dedup();
+    Ok(FormulaInfo {
+        expr: expr.to_string(),
+        ast,
+        deps,
+    })
+}
+
+/// Scan the entire tree for formulas. Used once per store open / recovery;
+/// per-commit maintenance goes through `update_index`.
+///
+/// Lenient on parse errors: a formula that fails to parse can only come
+/// from a snapshot written by something else (live commits reject them), so
+/// it is skipped with a warning — its stale cached value stays inert in the
+/// tree — rather than making every subsequent commit fail (the historical
+/// behavior) or bricking recovery outright.
+pub fn scan_index(root: &Arc<Node>) -> FormulaIndex {
+    let mut found: Vec<(Pointer, String)> = Vec::new();
     walk(root, |toks, node| {
-        if matches!(&**node, Node::Formula(_)) {
-            index.insert(Pointer::from_tokens(
-                toks.iter().map(|t| t.to_string()).collect(),
-            ));
+        if let Node::Formula(f) = &**node {
+            let path = Pointer::from_tokens(toks.iter().map(|t| t.to_string()).collect());
+            found.push((path, f.expr.clone()));
         }
     });
+    let mut index = FormulaIndex::new();
+    for (path, expr) in found {
+        match parse_info(&expr) {
+            Ok(info) => index.insert(path, Arc::new(info)),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "skipping unparseable formula in scan")
+            }
+        }
+    }
     index
 }
 
@@ -486,165 +632,295 @@ pub fn scan_index(root: &Arc<Node>) -> BTreeSet<Pointer> {
 /// overlapping a scan root are dropped and rediscovered by rescanning just
 /// that subtree — commits that never touch a formula-bearing subtree cost
 /// only the size of what they wrote, not the size of the document.
+/// Errors with `FormulaParse` if a formula this commit wrote fails to
+/// parse — rejecting the commit, exactly as evaluation-time parsing used
+/// to. A *pre-existing* unparseable formula (possible only via a foreign
+/// snapshot; see `scan_index`) no longer rejects unrelated commits.
 pub fn update_index(
-    prev: &BTreeSet<Pointer>,
+    prev: &FormulaIndex,
     scan_roots: &[Pointer],
     root: &Arc<Node>,
-) -> BTreeSet<Pointer> {
+) -> Result<FormulaIndex> {
     if scan_roots.is_empty() {
-        return prev.clone();
+        return Ok(prev.clone());
     }
-    let mut index: BTreeSet<Pointer> = prev
-        .iter()
-        .filter(|e| !scan_roots.iter().any(|sr| sr.overlaps(e)))
-        .cloned()
-        .collect();
+    let mut index = prev.clone();
+    // Collect removals across all scan roots first — roots may overlap.
+    let mut removed: BTreeSet<Pointer> = BTreeSet::new();
     for sr in scan_roots {
-        // A dropped entry strictly above the scan root is untouched by the
-        // write unless the write replaced it; re-add it if it survived.
-        for e in prev.iter().filter(|e| e.is_prefix_of(sr) && *e != sr) {
-            if matches!(get_at(root, e).as_deref(), Some(Node::Formula(_))) {
-                index.insert(e.clone());
-            }
-        }
-        if let Some(sub) = get_at(root, sr) {
-            walk(&sub, |toks, node| {
-                if matches!(&**node, Node::Formula(_)) {
-                    let mut t = sr.tokens().to_vec();
-                    t.extend(toks.iter().map(|c| c.to_string()));
-                    index.insert(Pointer::from_tokens(t));
-                }
-            });
-        }
-    }
-    index
-}
-
-/// Materialize evaluation entries for the indexed formula locations.
-fn entries(root: &Arc<Node>, index: &BTreeSet<Pointer>) -> Result<Vec<FormulaEntry>> {
-    let mut out = Vec::with_capacity(index.len());
-    for p in index {
-        let Some(node) = get_at(root, p) else {
-            debug_assert!(false, "formula index points at missing node {p}");
-            continue;
-        };
-        let Node::Formula(f) = &*node else {
-            debug_assert!(false, "formula index points at non-formula {p}");
-            continue;
-        };
-        let ast = parse(&f.expr)?;
-        let deps = dependencies(&ast);
-        out.push(FormulaEntry {
-            path: p.clone(),
-            expr: f.expr.clone(),
-            ast,
-            deps,
-            cached: f.cached.clone(),
+        overlapping(&prev.formulas, sr, |k, _| {
+            removed.insert(k.clone());
         });
     }
-    Ok(out)
+    for p in &removed {
+        index.remove(p);
+    }
+    // A dropped entry strictly above a scan root is untouched by the write
+    // unless the write replaced it; re-add it if it survived. Writes below
+    // a formula node are rejected, so a survivor's expression is unchanged
+    // and its parsed info can be reused — the expr check is belt-and-braces.
+    for p in &removed {
+        if !scan_roots.iter().any(|sr| p.is_prefix_of(sr) && p != sr) {
+            continue;
+        }
+        if let Some(Node::Formula(f)) = get_at(root, p).as_deref() {
+            let info = match prev.formulas.get(p) {
+                Some(old) if old.expr == f.expr => old.clone(),
+                _ => Arc::new(parse_info(&f.expr)?),
+            };
+            index.insert(p.clone(), info);
+        }
+    }
+    // Rescan the written subtrees. Reuse the old parsed info whenever the
+    // expression text is unchanged (identical re-PUTs never reparse).
+    for sr in scan_roots {
+        let Some(sub) = get_at(root, sr) else {
+            continue;
+        };
+        let mut found: Vec<(Pointer, String)> = Vec::new();
+        walk(&sub, |toks, node| {
+            if let Node::Formula(f) = &**node {
+                let mut t = sr.tokens().to_vec();
+                t.extend(toks.iter().map(|c| c.to_string()));
+                found.push((Pointer::from_tokens(t), f.expr.clone()));
+            }
+        });
+        for (path, expr) in found {
+            let info = match prev.formulas.get(&path) {
+                Some(old) if old.expr == expr => old.clone(),
+                _ => Arc::new(parse_info(&expr)?),
+            };
+            index.insert(path, info);
+        }
+    }
+    Ok(index)
 }
 
 /// Re-evaluate formulas affected by `changed` paths, using the maintained
-/// `index` of formula locations (no tree scan). Returns the new root and
-/// the set of formula paths whose value actually changed. Errors with
-/// `FormulaCycle` if the dependency graph is cyclic.
+/// dependency `index` (no tree scan, no reparse). The dirty set is seeded
+/// from the changed paths, closed over reverse dependency edges, and only
+/// that subgraph is sorted and evaluated — cost is proportional to what the
+/// commit actually touched, not to the number of formulas in the document.
+/// Returns the new root and the set of formula paths whose value actually
+/// changed. Errors with `FormulaCycle` if the *dirty* subgraph is cyclic:
+/// a newly formed cycle always includes a formula this commit wrote, so it
+/// is always seeded and rejected; a pre-existing cycle in an untouched
+/// region (possible only via a foreign snapshot) no longer rejects
+/// unrelated commits.
 pub fn reevaluate(
     root: &Arc<Node>,
     changed: &BTreeSet<Pointer>,
-    index: &BTreeSet<Pointer>,
+    index: &FormulaIndex,
 ) -> Result<(Arc<Node>, BTreeSet<Pointer>)> {
-    if index.is_empty() {
+    if index.is_empty() || changed.is_empty() {
         return Ok((root.clone(), BTreeSet::new()));
-    }
-    let entries = entries(root, index)?;
-    if entries.is_empty() {
-        return Ok((root.clone(), BTreeSet::new()));
-    }
-    let n = entries.len();
-
-    // edges[i] = indices i depends on
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut rev: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for i in 0..n {
-        for j in 0..n {
-            if entries[i].deps.iter().any(|d| d.overlaps(&entries[j].path)) {
-                if i == j {
-                    return Err(StoreError::FormulaCycle(entries[i].path.to_string()));
-                }
-                edges[i].push(j);
-                rev[j].push(i);
-            }
-        }
-    }
-
-    // Cycle detection + topological order (DFS, deps first).
-    let mut state = vec![0u8; n]; // 0 unvisited, 1 in progress, 2 done
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    fn dfs(
-        i: usize,
-        edges: &[Vec<usize>],
-        state: &mut [u8],
-        order: &mut Vec<usize>,
-        entries: &[FormulaEntry],
-    ) -> Result<()> {
-        state[i] = 1;
-        for &j in &edges[i] {
-            match state[j] {
-                0 => dfs(j, edges, state, order, entries)?,
-                1 => return Err(StoreError::FormulaCycle(entries[j].path.to_string())),
-                _ => {}
-            }
-        }
-        state[i] = 2;
-        order.push(i);
-        Ok(())
-    }
-    for i in 0..n {
-        if state[i] == 0 {
-            dfs(i, &edges, &mut state, &mut order, &entries)?;
-        }
     }
 
     // Dirty = formulas whose own path or any dependency overlaps a changed
     // path, plus everything that transitively depends on a dirty formula.
-    let mut dirty: HashSet<usize> = HashSet::new();
-    for (i, e) in entries.iter().enumerate() {
-        let touched = changed
-            .iter()
-            .any(|c| c.overlaps(&e.path) || e.deps.iter().any(|d| d.overlaps(c)));
-        if touched {
-            dirty.insert(i);
-        }
+    let mut dirty: BTreeSet<Pointer> = BTreeSet::new();
+    for c in changed {
+        index.affected_by(c, &mut dirty);
     }
-    let mut queue: Vec<usize> = dirty.iter().cloned().collect();
-    while let Some(i) = queue.pop() {
-        for &up in &rev[i] {
-            if dirty.insert(up) {
+    let mut queue: Vec<Pointer> = dirty.iter().cloned().collect();
+    while let Some(p) = queue.pop() {
+        let mut ups = BTreeSet::new();
+        index.dependents_of(&p, &mut ups);
+        for up in ups {
+            if dirty.insert(up.clone()) {
                 queue.push(up);
             }
         }
     }
+    if dirty.is_empty() {
+        return Ok((root.clone(), BTreeSet::new()));
+    }
 
+    // Dependency edges within the dirty subgraph only. edge j -> i means
+    // formula i depends on formula j (i re-evaluates after j).
+    let paths: Vec<Pointer> = dirty.into_iter().collect(); // sorted
+    let pos: HashMap<&Pointer, usize> = paths.iter().enumerate().map(|(i, p)| (p, i)).collect();
+    let n = paths.len();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indeg: Vec<usize> = vec![0; n];
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for (i, p) in paths.iter().enumerate() {
+        let Some(info) = index.get(p) else {
+            debug_assert!(false, "formula index missing dirty entry {p}");
+            continue;
+        };
+        let mut self_cycle = false;
+        for d in &info.deps {
+            overlapping(&index.formulas, d, |q, _| {
+                let Some(&j) = pos.get(q) else { return };
+                if i == j {
+                    self_cycle = true;
+                } else if seen.insert((j, i)) {
+                    edges[j].push(i);
+                    indeg[i] += 1;
+                }
+            });
+        }
+        if self_cycle {
+            return Err(StoreError::FormulaCycle(p.to_string()));
+        }
+    }
+
+    // Iterative topological order (Kahn's), ready set drained in ascending
+    // path order so evaluation order is deterministic. Any valid order
+    // yields identical values — every eval reads only its declared deps —
+    // but determinism keeps replay and diagnostics predictable.
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = indeg
+        .iter()
+        .enumerate()
+        .filter(|(_, &d)| d == 0)
+        .map(|(i, _)| std::cmp::Reverse(i))
+        .collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &j in &edges[i] {
+            indeg[j] -= 1;
+            if indeg[j] == 0 {
+                ready.push(std::cmp::Reverse(j));
+            }
+        }
+    }
+    if order.len() < n {
+        // Everything left has positive in-degree: a cycle (or downstream
+        // of one). Report the lowest path for determinism.
+        let p = indeg
+            .iter()
+            .position(|&d| d > 0)
+            .map(|i| &paths[i])
+            .expect("leftover node with zero in-degree");
+        return Err(StoreError::FormulaCycle(p.to_string()));
+    }
+
+    // Evaluate deps-first against the progressively updated root; each
+    // formula is written at most once, so the pre-commit cached value is
+    // still in the tree when we compare against it.
     let mut r = root.clone();
     let mut fchanged = BTreeSet::new();
     for &i in &order {
-        if !dirty.contains(&i) {
+        let path = &paths[i];
+        let Some(info) = index.get(path) else {
             continue;
-        }
-        let e = &entries[i];
-        let new_cached = match eval(&e.ast, &r) {
+        };
+        let Some(node) = get_at(&r, path) else {
+            debug_assert!(false, "formula index points at missing node {path}");
+            continue;
+        };
+        let Node::Formula(f) = &*node else {
+            debug_assert!(false, "formula index points at non-formula {path}");
+            continue;
+        };
+        let new_cached = match eval(&info.ast, &r) {
             Ok(v) => from_value(&v),
             Err(msg) => Arc::new(Node::String(format!("#ERR: {msg}"))),
         };
-        if !nodes_equal(&new_cached, &e.cached) {
+        if !nodes_equal(&new_cached, &f.cached) {
             let node = Arc::new(Node::Formula(FormulaNode {
-                expr: e.expr.clone(),
+                expr: f.expr.clone(),
                 cached: new_cached,
             }));
-            r = set_at(&r, &e.path, node)?;
-            fchanged.insert(e.path.clone());
+            r = set_at(&r, path, node)?;
+            fchanged.insert(path.clone());
         }
     }
     Ok((r, fchanged))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ptr(s: &str) -> Pointer {
+        Pointer::parse(s).unwrap()
+    }
+
+    #[test]
+    fn descendant_scan_stops_at_token_boundaries() {
+        let mut map: OrdMap<Pointer, ()> = OrdMap::new();
+        for k in ["/a", "/a/b", "/a/b/c", "/a/z", "/ab", "/b"] {
+            map.insert(ptr(k), ());
+        }
+        // /ab is a sibling of /a, not a descendant — token-vector ordering
+        // keeps /a's true descendants contiguous right after it.
+        let hits: Vec<String> = descendants(&map, &ptr("/a"))
+            .map(|(k, _)| k.to_string())
+            .collect();
+        assert_eq!(hits, vec!["/a/b", "/a/b/c", "/a/z"]);
+        // Everything descends from the root.
+        assert_eq!(descendants(&map, &Pointer::root()).count(), map.len());
+    }
+
+    #[test]
+    fn update_index_maintains_both_maps() {
+        let root = from_value(&json!({"a": 1, "f": {"$formula": "/a + 1"}}));
+        let index = scan_index(&root);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(&ptr("/f")).unwrap().deps, vec![ptr("/a")]);
+        assert!(index.rev.get(&ptr("/a")).unwrap().contains(&ptr("/f")));
+
+        // Overwriting the formula with a plain value empties both maps.
+        let root2 = from_value(&json!({"a": 1, "f": 2}));
+        let index2 = update_index(&index, &[ptr("/f")], &root2).unwrap();
+        assert!(index2.is_empty());
+        assert!(index2.rev.is_empty(), "empty dependent sets must be pruned");
+
+        // Replacing it with a formula on another dep moves the rev key.
+        let root3 = from_value(&json!({"a": 1, "b": 2, "f": {"$formula": "/b * 2"}}));
+        let index3 = update_index(&index, &[ptr("/f")], &root3).unwrap();
+        assert_eq!(index3.len(), 1);
+        assert!(index3.rev.get(&ptr("/a")).is_none());
+        assert!(index3.rev.get(&ptr("/b")).unwrap().contains(&ptr("/f")));
+    }
+
+    #[test]
+    fn unchanged_expression_reuses_parsed_info() {
+        let root = from_value(&json!({"a": 1, "calc": {"f": {"$formula": "/a + 1"}}}));
+        let index = scan_index(&root);
+        let before = index.get(&ptr("/calc/f")).unwrap().clone();
+        // Identical re-write of the subtree: same Arc, no reparse.
+        let index2 = update_index(&index, &[ptr("/calc")], &root).unwrap();
+        assert!(Arc::ptr_eq(&before, index2.get(&ptr("/calc/f")).unwrap()));
+    }
+
+    #[test]
+    fn scan_index_skips_unparseable_formulas() {
+        let root = from_value(&json!({
+            "bad": {"$formula": "1 + + )", "$value": null},
+            "good": {"$formula": "2 * 3", "$value": 6},
+        }));
+        let index = scan_index(&root);
+        assert_eq!(index.len(), 1);
+        assert!(index.get(&ptr("/good")).is_some());
+    }
+
+    #[test]
+    fn preexisting_cycle_only_rejects_commits_that_touch_it() {
+        // A committed cycle is unreachable through the API (cycle-creating
+        // commits are rejected); it can only arrive via a foreign snapshot,
+        // which scan_index accepts as-is.
+        let root = from_value(&json!({
+            "f": {"$formula": "/g + 1", "$value": 1},
+            "g": {"$formula": "/f + 1", "$value": 2},
+            "x": 0,
+            "fx": {"$formula": "/x * 2", "$value": 99},
+        }));
+        let index = scan_index(&root);
+        assert_eq!(index.len(), 3);
+
+        // A change not touching the cycle re-evaluates only what it hit.
+        let changed: BTreeSet<Pointer> = [ptr("/x")].into_iter().collect();
+        let (_, fchanged) = reevaluate(&root, &changed, &index).unwrap();
+        assert_eq!(fchanged, [ptr("/fx")].into_iter().collect());
+
+        // A change touching the cycle is still rejected.
+        let changed: BTreeSet<Pointer> = [ptr("/g")].into_iter().collect();
+        let err = reevaluate(&root, &changed, &index).unwrap_err();
+        assert!(matches!(err, StoreError::FormulaCycle(_)), "got {err:?}");
+    }
 }

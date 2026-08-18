@@ -177,6 +177,25 @@ fn unrelated_formula_is_not_reevaluated() {
 }
 
 #[test]
+fn deep_formula_chain_evaluates_without_recursion() {
+    let store = Store::in_memory();
+    store.put("/base", json!(0)).unwrap();
+    // One Put creating a 5k-deep dependency chain — the topological sort
+    // must not recurse over it.
+    let mut chain = serde_json::Map::new();
+    chain.insert("f0".into(), formula("/base + 1"));
+    for i in 1..5000 {
+        chain.insert(format!("f{i}"), formula(&format!("/chain/f{} + 1", i - 1)));
+    }
+    store.put("/chain", serde_json::Value::Object(chain)).unwrap();
+    assert_eq!(store.get("/chain/f4999").unwrap(), Some(json!(5000)));
+
+    // One base write ripples the whole chain in a single commit.
+    store.put("/base", json!(10)).unwrap();
+    assert_eq!(store.get("/chain/f4999").unwrap(), Some(json!(5010)));
+}
+
+#[test]
 fn raw_read_exposes_expression_and_cache() {
     let store = Store::in_memory();
     store.put("/a", json!(1)).unwrap();

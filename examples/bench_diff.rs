@@ -81,6 +81,37 @@ fn main() {
     let index = visijson::formulas::scan_index(&head.root);
     println!("full scan_index (open/recovery only): {:?} ({} formulas)", t.elapsed(), index.len());
 
+    // Spreadsheet-shaped: many formulas alongside the data. Commit cost must
+    // scale with the formulas a change touches, not with all of them.
+    const FORMULAS: usize = 1_000;
+    let mut calc = Map::new();
+    for i in 0..FORMULAS {
+        calc.insert(
+            format!("f{i:04}"),
+            json!({ "$formula": format!("/players/u{i:05}/field_007 + 1") }),
+        );
+    }
+    let t = Instant::now();
+    store.put("/calc", Value::Object(calc)).unwrap();
+    println!("PUT creating {FORMULAS} formulas:         {:?}", t.elapsed());
+
+    let t = Instant::now();
+    store.put("/players/u00042/field_007", json!(7)).unwrap();
+    println!("single-field PUT, 1 formula dirty:   {:?}", t.elapsed());
+
+    let t = Instant::now();
+    store.put("/players/u10000/field_009", json!(9)).unwrap();
+    println!("single-field PUT, 0 formulas dirty:  {:?}", t.elapsed());
+
+    let head = store.head();
+    let changed: std::collections::BTreeSet<_> =
+        [visijson::model::Pointer::parse("/players/u10000/field_009").unwrap()]
+            .into_iter()
+            .collect();
+    let t = Instant::now();
+    visijson::formulas::reevaluate(&head.root, &changed, &head.formulas).unwrap();
+    println!("reevaluate, {FORMULAS} formulas 0 dirty:  {:?}", t.elapsed());
+
     // Typed fast lane: native struct diffing via #[derive(Document)].
     // Clones happen before the timers — a real poller hands over freshly
     // fetched data, so sync() itself is what we measure.

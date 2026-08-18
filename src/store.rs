@@ -36,7 +36,7 @@ pub struct Committed {
     /// Monotonic with respect to earlier commits even if the clock isn't.
     pub time_ms: u64,
     pub root: Arc<Node>,
-    pub formulas: BTreeSet<Pointer>,
+    pub formulas: formulas::FormulaIndex,
     pub mods: ModIndex,
 }
 
@@ -426,7 +426,7 @@ impl Store {
         time_ms: u64,
     ) -> Result<Option<CommitInfo>> {
         let (root, changed, scan_roots) = apply_ops(&cur.root, ops)?;
-        let formulas = formulas::update_index(&cur.formulas, &scan_roots, &root);
+        let formulas = formulas::update_index(&cur.formulas, &scan_roots, &root)?;
         let (root, fchanged) = formulas::reevaluate(&root, &changed, &formulas)?;
         // A commit that changed nothing (e.g. re-PUTting an identical
         // fetch) is elided entirely: no version bump, no WAL, no event.

@@ -195,6 +195,41 @@ fn wal_records_effects_not_whole_requests() {
 }
 
 #[test]
+fn foreign_snapshot_cycle_only_rejects_commits_that_touch_it() {
+    let dir = TempDir::new().unwrap();
+    // A formula cycle can't be committed through the API; simulate a
+    // snapshot written by something else that contains one.
+    std::fs::write(
+        dir.path().join("snapshot.json"),
+        serde_json::to_string(&json!({
+            "version": 1,
+            "time_ms": 0,
+            "root": {
+                "f": {"$formula": "/g + 1", "$value": 1},
+                "g": {"$formula": "/f + 1", "$value": 2},
+                "x": 0
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let store = open(dir.path());
+    // Commits that don't touch the cycle proceed.
+    store.put("/x", json!(5)).unwrap();
+    assert_eq!(store.get("/x").unwrap(), Some(json!(5)));
+    // Re-writing a member of the cycle is still rejected.
+    let err = store.put("/f", json!({"$formula": "/g + 1"})).unwrap_err();
+    assert!(
+        matches!(err, visijson::error::StoreError::FormulaCycle(_)),
+        "got {err:?}"
+    );
+    // Replacing a member with a plain value legitimately breaks the cycle.
+    store.put("/g", json!(0)).unwrap();
+    assert_eq!(store.get("/f").unwrap(), Some(json!(1)));
+}
+
+#[test]
 fn commit_timestamps_and_validators_survive_restart() {
     let dir = TempDir::new().unwrap();
     let (v_at_write, t_at_write) = {

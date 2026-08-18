@@ -9,7 +9,6 @@
 //!   version > snapshot version, re-running each commit's ops and formula
 //!   re-evaluation. A torn final line (crash mid-append) is tolerated.
 
-use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -20,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::formulas;
 use crate::meta::{ModIndex, Stamp};
-use crate::model::{empty_object, Node, Pointer};
+use crate::model::{empty_object, Node};
 use crate::store::{apply_ops, Op};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,7 +52,7 @@ pub struct Recovered {
     pub version: u64,
     pub time_ms: u64,
     pub root: Arc<Node>,
-    pub formulas: BTreeSet<Pointer>,
+    pub formulas: formulas::FormulaIndex,
     pub mods: ModIndex,
 }
 
@@ -64,7 +63,7 @@ impl Recovered {
             version: 0,
             time_ms: 0,
             root: empty_object(),
-            formulas: BTreeSet::new(),
+            formulas: formulas::FormulaIndex::new(),
             mods: ModIndex::new(Stamp::default()),
         }
     }
@@ -167,7 +166,7 @@ impl Persistence {
                 break;
             }
             let (r, changed, scan_roots) = apply_ops(&root, &record.ops)?;
-            index = formulas::update_index(&index, &scan_roots, &r);
+            index = formulas::update_index(&index, &scan_roots, &r)?;
             let (r, fchanged) = formulas::reevaluate(&r, &changed, &index)?;
             root = r;
             version = record.version;
