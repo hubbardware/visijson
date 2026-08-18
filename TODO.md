@@ -188,8 +188,9 @@ Measured (8 writers): Sync 270 → 1041 ops/s (4 rec/fsync; p50 30ms →
 
 ## 10. Commit rebase on CAS loss
 
-**Done (2026-08-18), flag-gated** via `StoreConfig.rebase_on_conflict`
-(`REBASE=1` env), default **off** pending soak. When a Put/Merge-only
+**Done (2026-08-18)** via `StoreConfig.rebase_on_conflict`, default **on**
+since 2026-08-18 (`REBASE=0` env disables) — the starvation evidence below
+settled the default; the whole test suite now runs with it enabled. When a Put/Merge-only
 commit loses the CAS, `Store::try_rebase` re-checks conditions against the
 winner's head and takes the fast path iff every scan-root subtree is
 `Arc::ptr_eq` between our base and the head (structural sharing makes
@@ -209,8 +210,8 @@ on, then WAL replay into a fresh store must be `nodes_equal` with the
 live head — replay is an independent implementation of the same
 semantics. Stress-ran 10× in release.
 
-**Why the flag should probably default on after soak** (bench_write
-`mixed` section): one poll-style 2000×20 replacer racing 4 small writers
+**Why it defaults on** (bench_write `mixed` section): one poll-style
+2000×20 replacer racing 4 small writers
 — with rebase off the replacer **starves outright** (20/20 replaces
 exhaust the 64-retry cap; 10.5k CAS losses, zero successes; before #8's
 cap this spun forever), with rebase on it's 20/20 at ~7.8ms each.

@@ -112,7 +112,8 @@ pub struct StoreConfig {
     /// the winner's root instead of redoing the whole preparation. Only
     /// safe-provably-equivalent cases take the fast path (Put/Merge ops,
     /// winner untouched our subtrees, no formulas implicated); everything
-    /// else silently falls back to full replay.
+    /// else silently falls back to full replay. On by default: without it,
+    /// a large replace racing hot small writers can starve to `RetryLimit`.
     pub rebase_on_conflict: bool,
 }
 
@@ -122,7 +123,7 @@ impl Default for StoreConfig {
             data_dir: None,
             durability: Durability::Sync,
             max_retries: 64,
-            rebase_on_conflict: false,
+            rebase_on_conflict: true,
         }
     }
 }
