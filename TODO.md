@@ -36,11 +36,41 @@ timing is *within* the commit, like all formulas. Prefer keyed
 (`map_values`) view shapes over arrays — stable keys keep subscription
 diffs small.
 
+**Design settled (2026-08-18) — ownership and placement:**
+- **Named, persistent until deleted, global. No users, no sessions.**
+  Session-tied views fight the architecture: formulas live in the
+  committed tree (durable, subscribable, evaluated within the commit),
+  while sessions are ephemeral — they'd either churn the WAL on every
+  connect/disconnect (SSE auto-reconnect would thrash) or need an
+  in-memory overlay evaluated outside the pipeline, forking the formula
+  machinery. And HTTP "sessions" mean minting tokens + liveness + GC —
+  a half-built identity system; if we build identity, build it once as
+  #6. Sharing is also the point: one leaderboard evaluation serving
+  every dashboard beats N private copies. Scratch views = unique names
+  deleted when done; if leaks ever matter, add TTL leases (expiry
+  without identity). Ownership/ACLs (`who defines`, `who reads`, the
+  jq-CPU concern below) layer on with #6 as plain metadata + per-path
+  ACLs.
+- **A view is *mechanically* just a formula** — zero new evaluation
+  machinery. `/views` is placement policy, and it earns its existence:
+  (a) data writers stomp formulas by design — Put/Merge reconcile whole
+  subtrees, so a consumer formula inside producer data dies on the next
+  full replace (`formulas_created_and_destroyed_by_deep_subtree_writes`
+  pins this); (b) cycle geometry forbids the "natural" spot — a view
+  can't live inside its own scope (`jq_view_depending_on_own_scope_is_
+  a_cycle`), so views need a region outside the data; (c) `/doc` reads
+  and exports stay pure data; (d) the namespace is where the rules
+  attach: definition writes shape-checked (must be a formula), values
+  read-only, `GET /views` an enumerable registry, one ACL boundary
+  later.
+- **Implementation wrinkle to solve at build time:** formulas resolve
+  pointers against the store root and existing doc formulas use paths
+  like `/players`, so the doc can't be nested under a key. Likely
+  shape: a reserved top-level key in the doc store's tree (e.g.
+  `$views`) that `/doc` routes hide, root-level full replaces are
+  special-cased to preserve, and `/views/...` maps onto.
+
 Still open:
-- The `/views` namespace itself: a view today is just a formula stored in
-  the document; `/views` should mount view definitions outside user data,
-  read-only, probably per-connection or named.
-- Lifetime: tied to the creating connection, or persistent until deleted?
 - jq programs are re-compiled on each evaluation (jaq's compiled `Filter`
   borrows its `Arena`/`Loader`, so caching it is a lifetime puzzle). The
   formula-AST half of this note was fixed by #7; jq compile caching
