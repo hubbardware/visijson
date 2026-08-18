@@ -216,3 +216,39 @@ semantics. Stress-ran 10× in release.
 exhaust the 64-retry cap; 10.5k CAS losses, zero successes; before #8's
 cap this spun forever), with rebase on it's 20/20 at ~7.8ms each.
 `Store::stats().rebases` tracks recoveries.
+
+## 11. TUI client alongside the embedded web UI
+
+A terminal UI (ratatui or similar) speaking the same HTTP API as the
+embedded web editor (`src/ui.html`): tree browser with expand/collapse,
+inline value editing, spreadsheet-style formula editing (mirroring the
+web UI's `$formula` affordances), and live updates by subscribing to
+document paths.
+
+Design notes:
+- **Live updates come free**: subscribe via SSE (`Accept:
+  text/event-stream`) or WebSocket on the document URL — same
+  snapshot-then-gap-free-patches contract the web UI uses. RFC 6902
+  patches (or merge-patch via the `merge-patch` subprotocol /
+  `patch=merge-patch` Accept parameter) apply to a local mirror of the
+  subtree.
+- **Conditional writes**: use ETags/`If-None-Match` for cheap refresh;
+  once `If-Match` on writes lands (#5's open half), the TUI should use it
+  for edit conflict detection.
+- Probably a separate binary (`src/bin/` or a workspace crate, e.g.
+  `visijson-tui`) so the server binary stays dependency-lean —
+  ratatui/crossterm shouldn't bloat the store.
+- Interacts with #4/#6: like the web UI, it should grey out or hide edit
+  affordances where the user can't write (read-only `/info`, per-path
+  ACLs later), driven by server-reported capabilities rather than the
+  client hardcoding namespace names.
+- Patch application against the local mirror is new client-side code
+  (the store's `typed` module is the in-process fast lane, not a wire
+  client); if a reusable client-side helper emerges, consider sharing it
+  with future client work rather than burying it in the TUI.
+
+Worth deciding when picking it up: whether it talks HTTP only (works
+against any running server, the honest client story) or can also open a
+data dir directly in-process (handy for offline inspection of snapshots
+and WAL segments, but must respect the `LOCK` file semantics — a second
+process on the same dir fails to start by design).
