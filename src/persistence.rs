@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StoreError};
 use crate::formulas;
-use crate::meta::{ModIndex, Stamp};
+use crate::meta::{ModIndex, ModIndexDump, Stamp};
 use crate::model::{empty_object, Node};
 use crate::stats::Stats;
 use crate::store::{apply_ops, Op};
@@ -72,6 +72,11 @@ struct SnapshotFile {
     #[serde(default)]
     time_ms: u64,
     root: Node,
+    /// Exact per-path validators as of `version` — absent in snapshots
+    /// from before the dump existed, in which case recovery falls back to
+    /// a floor (safe: over-estimates only cost refetches).
+    #[serde(default)]
+    mods: Option<ModIndexDump>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +84,7 @@ struct SnapshotOut<'a> {
     version: u64,
     time_ms: u64,
     root: &'a Node,
+    mods: ModIndexDump,
 }
 
 /// Everything rebuilt from disk at open.
@@ -212,17 +218,23 @@ impl Persistence {
     /// modification index starts at the snapshot as its floor and is
     /// sharpened by every replayed commit. Call before `start_writer`.
     pub fn recover(&self) -> Result<Recovered> {
-        let (mut version, mut time_ms, mut root) = match fs::read(&self.snapshot_path) {
-            Ok(bytes) => {
-                let snap: SnapshotFile = serde_json::from_slice(&bytes)?;
-                tracing::info!(version = snap.version, "recovered snapshot");
-                (snap.version, snap.time_ms, Arc::new(snap.root))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0, empty_object()),
-            Err(e) => return Err(e.into()),
-        };
+        let (mut version, mut time_ms, mut root, snap_mods) =
+            match fs::read(&self.snapshot_path) {
+                Ok(bytes) => {
+                    let snap: SnapshotFile = serde_json::from_slice(&bytes)?;
+                    tracing::info!(version = snap.version, "recovered snapshot");
+                    (snap.version, snap.time_ms, Arc::new(snap.root), snap.mods)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0, empty_object(), None),
+                Err(e) => return Err(e.into()),
+            };
         let mut index = formulas::scan_index(&root);
-        let mut mods = ModIndex::new(Stamp::new(version, time_ms));
+        // Exact validators from the snapshot when present (client ETags
+        // stay valid across the restart); floor otherwise. Replay sharpens
+        // either starting point.
+        let mut mods = snap_mods
+            .map(|d| ModIndex::from_dump(&d))
+            .unwrap_or_else(|| ModIndex::new(Stamp::new(version, time_ms)));
 
         let mut files = Vec::new();
         if self.legacy_wal_path.exists() {
@@ -389,11 +401,18 @@ impl Persistence {
     /// Atomically write a snapshot at `version` (temp file + rename). Safe
     /// outside any lock: the caller pins the tree by `Arc` and prunes
     /// sealed segments only after this returns.
-    pub fn write_snapshot(&self, version: u64, time_ms: u64, root: &Arc<Node>) -> Result<()> {
+    pub fn write_snapshot(
+        &self,
+        version: u64,
+        time_ms: u64,
+        root: &Arc<Node>,
+        mods: &ModIndex,
+    ) -> Result<()> {
         let snap = SnapshotOut {
             version,
             time_ms,
             root,
+            mods: mods.dump(),
         };
         let tmp = self.snapshot_path.with_extension("json.tmp");
         {

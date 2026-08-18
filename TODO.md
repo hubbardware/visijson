@@ -10,10 +10,13 @@ in-memory `Store` — full subscription semantics for free, read-only over
 HTTP, and the ticker churn no longer touches doc subscribers or the WAL.
 The document root is purely user data.
 
+**Done (2026-08-18):** `/version` folded into `/info` — the liveness
+ticker now reports the doc store's head as `/info/doc/{version,time_ms}`
+(lagging a live commit by at most one tick; the authoritative version for
+a write is its commit response, ETag, or subscription event), and the
+stray `GET /version` route is gone.
+
 Still open:
-- `/version` probably folds into `/info` (it reports the *doc* store's
-  version, so it would need to live in the info store as data, or `/info`
-  grows a computed member).
 - `/views` namespace arrives with #2.
 
 ## 2. Materialized views under `/views`
@@ -87,17 +90,26 @@ and snapshots. `meta::ModIndex` answers per-path last-modified in
 O(depth) via `own`/`sub` stamps, is carried in `Committed` as a persistent
 map, and always over-estimates so a stale 304 is impossible.
 
-Still open:
-- `If-Match` / `If-Unmodified-Since` on writes. The `conditions` machinery
-  can express it (compare-and-set on a version) once a path's version is
-  addressable as a condition target — today conditions compare *values*.
-- The mod index isn't persisted, so a restart from a snapshot resets every
-  path to the floor and invalidates client caches once. Persisting it (or
-  a digest of it) alongside the snapshot would avoid that.
-- `MAX_ENTRIES` (200k) collapse is untested at scale; if a workload hits it
-  routinely, consider pruning by age instead of wholesale collapse.
-- The embedded UI and SSE/WS paths don't use validators (they don't need
-  to — they're live), but the UI's static HTML could carry its own ETag.
+**Done (2026-08-18), the write half:**
+- `If-Match` / `If-Unmodified-Since` on all write verbs (PUT/POST/DELETE/
+  PATCH, both patch flavors): `Condition` grew a validator flavor
+  (`unmodified_version` / `unmodified_ms`, also reachable via `/txn`)
+  checked against the mod index inside the commit loop — so it holds at
+  commit time, including across a rebase — failing with 412
+  (`StoreError::PreconditionFailed`). The ETag is the version, `*` and
+  lists per RFC 9110 (weakly). Over-estimation stays safe: a validator can
+  spuriously fail (refetch + retry), never spuriously pass.
+- The mod index now rides the snapshot (`ModIndex::dump`/`from_dump`),
+  so a restart keeps exact per-path validators and client ETags stay
+  valid; pre-dump snapshots still fall back to the floor. Bounded by
+  `MAX_ENTRIES`.
+- The collapse path has a unit test (`collapse_keeps_answers_safe_never_
+  stale`) pinning the over-estimate invariant.
+
+Still open (cosmetic / revisit-if-hit):
+- If a workload hits the `MAX_ENTRIES` collapse routinely, consider
+  pruning by age instead of wholesale collapse.
+- The embedded UI's static HTML could carry its own ETag.
 
 ## 6. Permissions / users
 

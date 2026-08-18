@@ -16,9 +16,11 @@
 //!
 //! The index is persistent (`OrdMap`): a new version shares all untouched
 //! entries with the previous one, so carrying it in every `Committed` costs
-//! only the paths a commit actually wrote. It is **not** persisted to disk;
-//! after recovery it starts at a floor (see below) and re-sharpens as
-//! commits arrive.
+//! only the paths a commit actually wrote. Snapshots carry a [`dump`]
+//! (`ModIndex::dump`) of it, so recovery restores exact per-path validators
+//! (client ETags stay valid across a restart) and WAL replay re-sharpens
+//! from there; a snapshot without one (pre-dump format) falls back to the
+//! floor.
 //!
 //! ## Floor: safe answers for what the index doesn't know
 //!
@@ -73,6 +75,14 @@ pub struct ModIndex {
     floor: Stamp,
 }
 
+/// `ModIndex` in snapshot-file form: `(path, own_version, own_ms,
+/// sub_version, sub_ms)` rows plus the floor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModIndexDump {
+    floor: (u64, u64),
+    entries: Vec<(String, u64, u64, u64, u64)>,
+}
+
 impl ModIndex {
     /// An index that knows nothing yet: every path reports `floor`.
     pub fn new(floor: Stamp) -> Self {
@@ -102,6 +112,15 @@ impl ModIndex {
         stamp: Stamp,
         changed: impl IntoIterator<Item = &'a Pointer>,
     ) -> ModIndex {
+        self.record_capped(stamp, changed, MAX_ENTRIES)
+    }
+
+    fn record_capped<'a>(
+        &self,
+        stamp: Stamp,
+        changed: impl IntoIterator<Item = &'a Pointer>,
+        cap: usize,
+    ) -> ModIndex {
         let mut entries = self.entries.clone();
         for c in changed {
             // `own` for the changed path itself.
@@ -116,7 +135,7 @@ impl ModIndex {
                 prefix = prefix.push(tok.clone());
             }
         }
-        if entries.len() > MAX_ENTRIES {
+        if entries.len() > cap {
             tracing::info!(
                 entries = entries.len(),
                 version = stamp.version,
@@ -127,6 +146,48 @@ impl ModIndex {
         ModIndex {
             entries,
             floor: self.floor,
+        }
+    }
+
+    /// Compact serialized form for snapshots, so a restart keeps exact
+    /// per-path validators instead of resetting every path to a floor.
+    /// Bounded by [`MAX_ENTRIES`].
+    pub fn dump(&self) -> ModIndexDump {
+        ModIndexDump {
+            floor: (self.floor.version, self.floor.time_ms),
+            entries: self
+                .entries
+                .iter()
+                .map(|(p, e)| {
+                    (
+                        p.to_string(),
+                        e.own.version,
+                        e.own.time_ms,
+                        e.sub.version,
+                        e.sub.time_ms,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild from a snapshot dump. An unparsable path is skipped — the
+    /// floor keeps its answers safe (over-estimates only).
+    pub fn from_dump(d: &ModIndexDump) -> ModIndex {
+        let mut entries = OrdMap::new();
+        for (path, own_v, own_t, sub_v, sub_t) in &d.entries {
+            let Ok(p) = Pointer::parse(path) else { continue };
+            entries.insert(
+                p,
+                Entry {
+                    own: Stamp::new(*own_v, *own_t),
+                    sub: Stamp::new(*sub_v, *sub_t),
+                },
+            );
+        }
+        ModIndex {
+            entries,
+            floor: Stamp::new(d.floor.0, d.floor.1),
         }
     }
 
@@ -196,5 +257,41 @@ mod tests {
     fn floor_answers_paths_the_index_never_saw() {
         let idx = ModIndex::new(Stamp::new(7, 700));
         assert_eq!(idx.last_modified(&p("/never/written")), Stamp::new(7, 700));
+    }
+
+    #[test]
+    fn dump_roundtrip_preserves_every_answer() {
+        let idx = ModIndex::new(Stamp::new(1, 100))
+            .record(Stamp::new(2, 200), [&p("/a/b/c")])
+            .record(Stamp::new(3, 300), [&p("/x")]);
+        let restored = ModIndex::from_dump(&idx.dump());
+        for probe in ["/a/b/c", "/a/b", "/a", "/a/b/c/deeper", "/a/b/other", "/x", "/z", ""] {
+            assert_eq!(
+                restored.last_modified(&p(probe)),
+                idx.last_modified(&p(probe)),
+                "at {probe}"
+            );
+        }
+    }
+
+    #[test]
+    fn collapse_keeps_answers_safe_never_stale() {
+        let idx = ModIndex::new(Stamp::new(1, 100)).record(Stamp::new(2, 200), [&p("/kept")]);
+        // A tiny cap forces the collapse; the whole index becomes a floor
+        // at the collapsing commit's stamp.
+        let collapsed = idx.record_capped(Stamp::new(3, 300), [&p("/a/b"), &p("/c/d")], 4);
+        assert!(collapsed.is_empty());
+        assert_eq!(collapsed.floor(), Stamp::new(3, 300));
+        // Over-estimate invariant: every answer is >= the exact one — a
+        // needless refetch, never a stale 304.
+        for probe in ["/kept", "/a/b", "/c/d", "/never"] {
+            let exact = idx
+                .record(Stamp::new(3, 300), [&p("/a/b"), &p("/c/d")])
+                .last_modified(&p(probe));
+            assert!(
+                collapsed.last_modified(&p(probe)).version >= exact.version,
+                "stale answer at {probe}"
+            );
+        }
     }
 }

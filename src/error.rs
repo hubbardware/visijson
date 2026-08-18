@@ -10,6 +10,8 @@ pub enum StoreError {
     TypeMismatch { path: String, msg: String },
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
     #[error("transaction retry limit exceeded after {0} attempts")]
     RetryLimit(u32),
     #[error("formula parse error in `{expr}`: {msg}")]

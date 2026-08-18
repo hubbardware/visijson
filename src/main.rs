@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     if info_tick_secs > 0 {
-        api::spawn_info_ticker(info.clone(), Duration::from_secs(info_tick_secs));
+        api::spawn_info_ticker(info.clone(), store.clone(), Duration::from_secs(info_tick_secs));
     }
 
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());

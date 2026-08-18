@@ -475,18 +475,23 @@ fn commit_timestamps_and_validators_survive_restart() {
     // /early is older than /late and must stay distinguishable.
     assert!(store.last_modified("/early").unwrap().version < s.version);
 
-    // Snapshot + restart: the index resets to a floor, which must still be
-    // a safe (never older than truth) answer.
+    // Snapshot + restart: the mod index rides the snapshot, so validators
+    // stay *exact* — client ETags remain valid across the restart instead
+    // of resetting to a whole-store floor.
     store.snapshot().unwrap();
     let v = store.version();
     drop(store);
     let store = open(dir.path());
     let s = store.last_modified("/early").unwrap();
-    assert_eq!(s.version, v, "floor should be the snapshot version");
-    assert!(s.time_ms >= t_at_write);
+    assert_eq!(
+        s.version,
+        v_at_write - 1,
+        "expected /early's exact pre-snapshot stamp, not a floor"
+    );
+    assert_eq!(store.last_modified("/late").unwrap().version, v_at_write);
 
-    // And new writes after recovery are exact again.
+    // And new writes after recovery keep sharpening.
     store.put("/early", json!(2)).unwrap();
     assert_eq!(store.last_modified("/early").unwrap().version, v + 1);
-    assert_eq!(store.last_modified("/late").unwrap().version, v);
+    assert_eq!(store.last_modified("/late").unwrap().version, v_at_write);
 }

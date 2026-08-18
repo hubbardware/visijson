@@ -85,13 +85,55 @@ pub enum Op {
     Merge { path: String, value: Arc<Node> },
 }
 
-/// A precondition for a transactional commit: the plain value at `path` must
-/// equal `expected` (`None` = the path must be absent).
+/// A commit precondition. Two flavors:
+///
+/// - **Value** (the original): the plain value at `path` must equal
+///   `expected` (`None` = the path must be absent). Failure is `Conflict`
+///   (HTTP 409).
+/// - **Validator** (either `unmodified_*` field set): the subtree at `path`
+///   must not have been modified after the given version (`If-Match` — the
+///   ETag *is* the version) or wall-clock time (`If-Unmodified-Since`).
+///   Failure is `PreconditionFailed` (HTTP 412). With a validator present,
+///   `expected` is only checked when explicitly `Some` — `None` no longer
+///   asserts absence. Checked against the modification index, which may
+///   over-estimate (post-collapse or pre-dump-restart floor): a validator
+///   can spuriously fail (client refetches and retries) but never
+///   spuriously pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Condition {
     pub path: String,
     #[serde(default)]
     pub expected: Option<Value>,
+    #[serde(default)]
+    pub unmodified_version: Option<u64>,
+    /// Epoch milliseconds; callers translating second-granularity HTTP
+    /// dates should pass the last millisecond of the second.
+    #[serde(default)]
+    pub unmodified_ms: Option<u64>,
+}
+
+impl Condition {
+    /// Value flavor: the plain value at `path` must equal `expected`
+    /// (`None` = must be absent).
+    pub fn value(path: impl Into<String>, expected: Option<Value>) -> Self {
+        Condition {
+            path: path.into(),
+            expected,
+            unmodified_version: None,
+            unmodified_ms: None,
+        }
+    }
+
+    /// Validator flavor: `path` must not have been modified after
+    /// `version` (`If-Match` semantics — the ETag is the version).
+    pub fn unmodified_since_version(path: impl Into<String>, version: u64) -> Self {
+        Condition {
+            path: path.into(),
+            expected: None,
+            unmodified_version: Some(version),
+            unmodified_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,10 +327,40 @@ fn parent_array(root: &Arc<Node>, p: &Pointer) -> Option<Pointer> {
     matches!(get_at(root, &parent).as_deref(), Some(Node::Array(_))).then_some(parent)
 }
 
-fn check_conditions(root: &Arc<Node>, conditions: &[Condition]) -> Result<()> {
+fn check_conditions(cur: &Committed, conditions: &[Condition]) -> Result<()> {
     for c in conditions {
         let p = Pointer::parse(&c.path)?;
-        let now = get_at(root, &p).map(|n| to_plain_value(&n));
+        let is_validator = c.unmodified_version.is_some() || c.unmodified_ms.is_some();
+        if is_validator {
+            let stamp = cur.mods.last_modified(&p);
+            if let Some(v) = c.unmodified_version {
+                if stamp.version > v {
+                    return Err(StoreError::PreconditionFailed(format!(
+                        "{} modified at version {} (required unmodified since {v})",
+                        c.path, stamp.version
+                    )));
+                }
+            }
+            if let Some(t) = c.unmodified_ms {
+                if stamp.time_ms > t {
+                    return Err(StoreError::PreconditionFailed(format!(
+                        "{} modified at {} (required unmodified since {t})",
+                        c.path, stamp.time_ms
+                    )));
+                }
+            }
+            if let Some(expected) = &c.expected {
+                let now = get_at(&cur.root, &p).map(|n| to_plain_value(&n));
+                if now.as_ref() != Some(expected) {
+                    return Err(StoreError::Conflict(format!(
+                        "condition failed at {}: expected {:?}, found {:?}",
+                        c.path, c.expected, now
+                    )));
+                }
+            }
+            continue;
+        }
+        let now = get_at(&cur.root, &p).map(|n| to_plain_value(&n));
         let ok = match (&c.expected, &now) {
             (Some(e), Some(v)) => e == v,
             (None, None) => true,
@@ -440,7 +512,7 @@ impl Store {
                 .all(|op| matches!(op, Op::Put { .. } | Op::Merge { .. }));
         for attempt in 0..self.max_retries {
             let cur = self.current.load_full();
-            check_conditions(&cur.root, conditions)?;
+            check_conditions(&cur, conditions)?;
             // Commit time never runs backwards, whatever the wall clock does.
             let time_ms = now_ms().max(cur.time_ms);
             match self.try_commit(&cur, &ops, time_ms, rebase.then_some(conditions))? {
@@ -547,7 +619,7 @@ impl Store {
     ) -> Result<Option<CommitInfo>> {
         // Preconditions were validated against `base`; the winner may have
         // invalidated them. A failure here is a real conflict, not a race.
-        check_conditions(&head.root, conditions)?;
+        check_conditions(head, conditions)?;
         for sr in scan_roots {
             let untouched = matches!(
                 (get_at(&base.root, sr), get_at(&head.root, sr)),
@@ -744,7 +816,7 @@ impl Store {
         let sealed = rotation
             .recv()
             .map_err(|_| StoreError::WalBroken("WAL writer thread exited".into()))??;
-        persistence.write_snapshot(pinned.version, pinned.time_ms, &pinned.root)?;
+        persistence.write_snapshot(pinned.version, pinned.time_ms, &pinned.root, &pinned.mods)?;
         persistence.prune(&sealed);
         Stats::bump(&self.stats.snapshots);
         Stats::add(&self.stats.snapshot_micros, t.elapsed().as_micros() as u64);

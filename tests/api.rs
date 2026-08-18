@@ -252,9 +252,137 @@ async fn browsers_get_the_embedded_ui_api_clients_get_json() {
 }
 
 #[tokio::test]
+async fn conditional_writes_if_match_and_if_unmodified_since() {
+    let (base, _store, _info) = serve().await;
+    let client = reqwest::Client::new();
+
+    // Seed and grab the ETag (== last-modified version of that subtree).
+    client
+        .put(format!("{base}/doc/a"))
+        .json(&json!(1))
+        .send()
+        .await
+        .unwrap();
+    let etag = client
+        .get(format!("{base}/doc/a"))
+        .send()
+        .await
+        .unwrap()
+        .headers()["etag"]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Matching If-Match proceeds…
+    let resp = client
+        .put(format!("{base}/doc/a"))
+        .header("if-match", &etag)
+        .json(&json!(2))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // …and the now-stale tag earns 412, leaving the value untouched.
+    let resp = client
+        .put(format!("{base}/doc/a"))
+        .header("if-match", &etag)
+        .json(&json!(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 412);
+    let v: Value = client
+        .get(format!("{base}/doc/a"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v, json!(2));
+
+    // `*` imposes no version constraint.
+    let resp = client
+        .put(format!("{base}/doc/a"))
+        .header("if-match", "*")
+        .json(&json!(4))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // If-Unmodified-Since in the past: 412. In the future: proceeds.
+    let resp = client
+        .delete(format!("{base}/doc/a"))
+        .header("if-unmodified-since", "Mon, 01 Jan 2001 00:00:00 GMT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 412);
+    let resp = client
+        .delete(format!("{base}/doc/a"))
+        .header("if-unmodified-since", "Fri, 01 Jan 2100 00:00:00 GMT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // PATCH (merge flavor) honors the validators too.
+    client
+        .put(format!("{base}/doc/obj"))
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    let etag = client
+        .get(format!("{base}/doc/obj"))
+        .send()
+        .await
+        .unwrap()
+        .headers()["etag"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let resp = client
+        .patch(format!("{base}/doc/obj"))
+        .header("if-match", &etag)
+        .json(&json!({"y": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .patch(format!("{base}/doc/obj"))
+        .header("if-match", "\"1\"")
+        .json(&json!({"z": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 412);
+
+    // /txn speaks validator conditions directly.
+    let resp = client
+        .post(format!("{base}/txn"))
+        .json(&json!({
+            "ops": [{"op": "put", "path": "/obj/x", "value": 9}],
+            "conditions": [{"path": "/obj", "unmodified_version": 1}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 412);
+}
+
+#[tokio::test]
 async fn info_ticker_heartbeats_beside_the_doc() {
     let (base, store, info) = serve().await;
-    visijson::api::spawn_info_ticker(info.clone(), std::time::Duration::from_millis(20));
+    store.put("/seed", json!(1)).unwrap(); // doc version the ticker reports
+    visijson::api::spawn_info_ticker(
+        info.clone(),
+        store.clone(),
+        std::time::Duration::from_millis(20),
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     let v = info.get("").unwrap().expect("info root should exist");
@@ -266,6 +394,8 @@ async fn info_ticker_heartbeats_beside_the_doc() {
     assert!(v["epoch_ms"].as_u64().unwrap() > 1_700_000_000_000);
     assert!(v["uptime_secs"].is_u64());
     assert_eq!(v["started"].as_str().unwrap().len(), 20);
+    // /version folded into /info: the doc store's version rides the tick.
+    assert_eq!(v["doc"]["version"].as_u64(), Some(store.version()));
 
     // Served over HTTP as a sibling of /doc: GET /info/time is the probe.
     let client = reqwest::Client::new();
@@ -321,8 +451,9 @@ async fn info_ticker_heartbeats_beside_the_doc() {
     };
     assert_eq!(change["type"], "change");
 
-    // ...and the document store never saw any of the churn.
-    assert_eq!(store.version(), 0, "ticker leaked into the doc store");
+    // ...and the document store never saw any of the churn (still at the
+    // seed commit's version).
+    assert_eq!(store.version(), 1, "ticker leaked into the doc store");
 }
 
 #[tokio::test]

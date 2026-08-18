@@ -106,10 +106,7 @@ fn conditions_guard_commits() {
                 path: "/state".into(),
                 value: visijson::model::from_value(&json!("published")),
             }],
-            &[Condition {
-                path: "/state".into(),
-                expected: Some(json!("draft")),
-            }],
+            &[Condition::value("/state", Some(json!("draft")))],
         )
         .unwrap();
     assert_eq!(store.get("/state").unwrap(), Some(json!("published")));
@@ -121,10 +118,7 @@ fn conditions_guard_commits() {
                 path: "/state".into(),
                 value: visijson::model::from_value(&json!("archived")),
             }],
-            &[Condition {
-                path: "/state".into(),
-                expected: Some(json!("draft")),
-            }],
+            &[Condition::value("/state", Some(json!("draft")))],
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::Conflict(_)));
@@ -137,10 +131,7 @@ fn conditions_guard_commits() {
                 path: "/state".into(),
                 value: visijson::model::from_value(&json!("x")),
             }],
-            &[Condition {
-                path: "/state".into(),
-                expected: None,
-            }],
+            &[Condition::value("/state", None)],
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::Conflict(_)));

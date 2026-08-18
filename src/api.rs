@@ -7,12 +7,12 @@
 //!   PATCH  /doc[/{path}]            RFC 6902 subset: add/replace/remove/test
 //!   DELETE /doc/{path}              remove
 //!   POST   /txn                     {"ops": [...], "conditions": [...]}
-//!   GET    /version                 current committed version
 //!   GET    /info[/{path}]           server liveness metadata — a read-only
 //!                                   sibling namespace backed by its own
 //!                                   in-memory store, so its once-a-second
 //!                                   churn never touches /doc subscribers
-//!                                   or the WAL
+//!                                   or the WAL; carries the doc store's
+//!                                   version at /info/doc/version
 //!
 //! GET on a document path is fully content-negotiated: a WebSocket upgrade
 //! subscribes to that path (snapshot, then ordered changes — event format
@@ -60,7 +60,6 @@ pub fn router(doc: Arc<Store>, info: Arc<Store>) -> Router {
                 .delete(delete_path),
         )
         .route("/txn", post(txn_handler))
-        .route("/version", get(version_handler))
         .with_state(doc)
         // /info is a sibling namespace over its own store, GET-only (reads,
         // the UI, and WebSocket subscriptions all negotiate off GET; writes
@@ -86,6 +85,7 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             StoreError::NotFound(_) => StatusCode::NOT_FOUND,
             StoreError::Conflict(_) | StoreError::RetryLimit(_) => StatusCode::CONFLICT,
+            StoreError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             StoreError::FormulaCycle(_) => StatusCode::UNPROCESSABLE_ENTITY,
             StoreError::InvalidPointer(_)
             | StoreError::TypeMismatch { .. }
@@ -207,46 +207,127 @@ async fn commit_blocking<T: Send + 'static>(
         .map_err(|e| StoreError::Io(std::io::Error::other(format!("commit task: {e}"))))?
 }
 
-async fn put_root(State(store): State<Arc<Store>>, Json(node): Json<Node>) -> ApiResult {
-    Ok(Json(commit_blocking(move || store.put_node("", Arc::new(node))).await?).into_response())
+/// Write preconditions from `If-Match` / `If-Unmodified-Since` (RFC 9110).
+/// The ETag for a path *is* its last-modified version, so `If-Match: "7"`
+/// means "unmodified since version 7"; a list matches if the newest listed
+/// version does; `*` (and, weakly, unparsable tags) impose no constraint.
+/// Failures surface as 412.
+fn write_conditions(headers: &HeaderMap, path: &str) -> Vec<Condition> {
+    let mut conds = Vec::new();
+    if let Some(im) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        if im.trim() != "*" {
+            let newest = im
+                .split(',')
+                .map(|t| t.trim())
+                .map(|t| t.strip_prefix("W/").unwrap_or(t))
+                .map(|t| t.trim_matches('"'))
+                .map(|t| t.strip_suffix("-raw").unwrap_or(t))
+                .filter_map(|t| t.parse::<u64>().ok())
+                .max();
+            if let Some(version) = newest {
+                conds.push(Condition {
+                    path: path.to_string(),
+                    expected: None,
+                    unmodified_version: Some(version),
+                    unmodified_ms: None,
+                });
+            }
+        }
+    }
+    if let Some(secs) = headers
+        .get(header::IF_UNMODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_date)
+    {
+        // The header has second granularity; anything within that final
+        // second still counts as unmodified.
+        let ms = u64::try_from(secs).unwrap_or(0) * 1000 + 999;
+        conds.push(Condition {
+            path: path.to_string(),
+            expected: None,
+            unmodified_version: None,
+            unmodified_ms: Some(ms),
+        });
+    }
+    conds
+}
+
+/// One conditional write: `op` at `ptr`, guarded by any `If-Match` /
+/// `If-Unmodified-Since` the request carried.
+async fn write_one(
+    store: Arc<Store>,
+    headers: &HeaderMap,
+    ptr: &str,
+    op: impl FnOnce(String) -> Op,
+) -> ApiResult {
+    let conds = write_conditions(headers, ptr);
+    let ops = vec![op(ptr.to_string())];
+    Ok(Json(commit_blocking(move || store.commit(ops, &conds)).await?).into_response())
+}
+
+async fn put_root(
+    State(store): State<Arc<Store>>,
+    headers: HeaderMap,
+    Json(node): Json<Node>,
+) -> ApiResult {
+    let value = Arc::new(node);
+    write_one(store, &headers, "", |path| Op::Put { path, value }).await
 }
 
 async fn put_path(
     State(store): State<Arc<Store>>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     Json(node): Json<Node>,
 ) -> ApiResult {
-    let ptr = pointer_of(&path);
-    Ok(Json(commit_blocking(move || store.put_node(&ptr, Arc::new(node))).await?).into_response())
+    let value = Arc::new(node);
+    write_one(store, &headers, &pointer_of(&path), |path| Op::Put {
+        path,
+        value,
+    })
+    .await
 }
 
 // ------------------------------------------------------------------ POST (append)
 
-async fn post_root(State(store): State<Arc<Store>>, Json(node): Json<Node>) -> ApiResult {
-    Ok(Json(commit_blocking(move || store.append_node("", Arc::new(node))).await?).into_response())
+async fn post_root(
+    State(store): State<Arc<Store>>,
+    headers: HeaderMap,
+    Json(node): Json<Node>,
+) -> ApiResult {
+    let value = Arc::new(node);
+    write_one(store, &headers, "", |path| Op::Append { path, value }).await
 }
 
 async fn post_path(
     State(store): State<Arc<Store>>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     Json(node): Json<Node>,
 ) -> ApiResult {
-    let ptr = pointer_of(&path);
-    Ok(
-        Json(commit_blocking(move || store.append_node(&ptr, Arc::new(node))).await?)
-            .into_response(),
-    )
+    let value = Arc::new(node);
+    write_one(store, &headers, &pointer_of(&path), |path| Op::Append {
+        path,
+        value,
+    })
+    .await
 }
 
 // ------------------------------------------------------------------ DELETE
 
-async fn delete_root(State(store): State<Arc<Store>>) -> ApiResult {
-    Ok(Json(commit_blocking(move || store.remove("")).await?).into_response())
+async fn delete_root(State(store): State<Arc<Store>>, headers: HeaderMap) -> ApiResult {
+    write_one(store, &headers, "", |path| Op::Remove { path }).await
 }
 
-async fn delete_path(State(store): State<Arc<Store>>, Path(path): Path<String>) -> ApiResult {
-    let ptr = pointer_of(&path);
-    Ok(Json(commit_blocking(move || store.remove(&ptr)).await?).into_response())
+async fn delete_path(
+    State(store): State<Arc<Store>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    write_one(store, &headers, &pointer_of(&path), |path| Op::Remove {
+        path,
+    })
+    .await
 }
 
 // ------------------------------------------------------------------ PATCH
@@ -281,6 +362,8 @@ fn patch_to_ops(prefix: &str, patch: Vec<PatchOp>) -> Result<(Vec<Op>, Vec<Condi
             "test" => conditions.push(Condition {
                 path: full,
                 expected: p.value,
+                unmodified_version: None,
+                unmodified_ms: None,
             }),
             other => {
                 return Err(StoreError::Unsupported(format!(
@@ -327,10 +410,16 @@ async fn apply_patch(
         || (!ct.starts_with("application/merge-patch+json") && body.is_array());
     if is_json_patch {
         let patch: Vec<PatchOp> = serde_json::from_value(body).map_err(StoreError::Serde)?;
-        let (ops, conditions) = patch_to_ops(&prefix, patch)?;
+        let (ops, mut conditions) = patch_to_ops(&prefix, patch)?;
+        conditions.extend(write_conditions(&headers, &prefix));
         Ok(Json(commit_blocking(move || store.commit(ops, &conditions)).await?).into_response())
     } else {
-        Ok(Json(commit_blocking(move || store.merge(&prefix, body)).await?).into_response())
+        let conditions = write_conditions(&headers, &prefix);
+        let ops = vec![Op::Merge {
+            path: prefix,
+            value: from_value(&body),
+        }];
+        Ok(Json(commit_blocking(move || store.commit(ops, &conditions)).await?).into_response())
     }
 }
 
@@ -351,18 +440,19 @@ async fn txn_handler(State(store): State<Arc<Store>>, Json(req): Json<TxnRequest
     )
 }
 
-// ------------------------------------------------------------------ /version
-
-async fn version_handler(State(store): State<Arc<Store>>) -> ApiResult {
-    Ok(Json(json!({ "version": store.version() })).into_response())
-}
-
 // ------------------------------------------------------------------ /info ticker
 
 /// Spawn the liveness ticker: rewrites the root of the (dedicated, in-memory)
-/// info store with wall-clock time and uptime every `period`. Subscribers of
-/// `/info` get a heartbeat; the document store never sees the churn.
-pub fn spawn_info_ticker(store: Arc<Store>, period: Duration) -> tokio::task::JoinHandle<()> {
+/// info store with wall-clock time, uptime, and the document store's current
+/// version every `period`. Subscribers of `/info` get a heartbeat; the
+/// document store never sees the churn. `/info/doc/version` lags a live
+/// commit by at most one tick — the authoritative version for a write is in
+/// its commit response, ETag, or subscription event.
+pub fn spawn_info_ticker(
+    store: Arc<Store>,
+    doc: Arc<Store>,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let started = SystemTime::now();
         let started_iso = rfc3339(started);
@@ -376,11 +466,13 @@ pub fn spawn_info_ticker(store: Arc<Store>, period: Duration) -> tokio::task::Jo
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let uptime = now.duration_since(started).unwrap_or_default().as_secs();
+            let head = doc.head();
             let info = json!({
                 "time": rfc3339(now),
                 "epoch_ms": epoch_ms,
                 "uptime_secs": uptime,
                 "started": started_iso,
+                "doc": { "version": head.version, "time_ms": head.time_ms },
             });
             if let Err(e) = store.put("", info) {
                 tracing::warn!(error = %e, "info ticker write failed");
