@@ -32,8 +32,9 @@ sticky reconcile) was considered and rejected: it breaks "what you PUT
 is what you GET", resurrects formulas producers deleted from their own
 schemas (fixable only with ownership metadata — i.e. users again), and
 doesn't address cycle geometry, which forbids in-scope placement
-regardless. Cheap crumb available any time: `GET /formulas` — a
-discovery listing (path + expression) straight off the `FormulaIndex`.
+regardless. `GET /formulas` — a discovery listing (path + expression)
+straight off the `FormulaIndex` — shipped 2026-08-18; the TUI's formula
+markers ride it.
 
 A connection should be able to create its own view of the data and read it
 under `/views/...` — like a materialized view, with all the existing
@@ -111,9 +112,15 @@ Still open:
   any `T: Serialize` directly into trees; (3) `#[derive(Document)]` +
   `TypedMount` retain the last synced struct and diff natively — unchanged
   20k × 110 sync ≈ 44ms and commits nothing; 3-field drift ≈ 35ms + 3 ops.
-  Still open if REST polling (not library mode) needs the same: a
-  reconciling *deserializer* that compares against the old tree while
-  parsing the request body.
+  The REST-polling half — a reconciling *deserializer* comparing against
+  the old tree while parsing the request body — done 2026-08-18
+  (`model::node_from_slice_reconciling`, used by the PUT handlers with
+  the current subtree as hint): an almost-unchanged poll body arrives
+  pre-shared, collapsing the commit-side reconcile+diff from ~218ms to
+  ~15ms on the 20k×110 shape (parse pays ~+90ms for hint lookups; net
+  ~1.4× total, and the contended portion inside the CAS loop shrinks
+  ~14×, which also makes lost races and rebases far cheaper for big
+  replaces).
 - ~~Path-copy cloning the 20k-entry parent map dominated single-field
   PUTs (~1.2ms)~~ — done 2026-08-06: `Node::Object` is now `imbl::OrdMap`
   (persistent B-tree: O(log n) path-copy, still sorted iteration).
@@ -190,7 +197,8 @@ map, and always over-estimates so a stale 304 is impossible.
 Still open (cosmetic / revisit-if-hit):
 - If a workload hits the `MAX_ENTRIES` collapse routinely, consider
   pruning by age instead of wholesale collapse.
-- The embedded UI's static HTML could carry its own ETag.
+- ~~The embedded UI's static HTML could carry its own ETag~~ — done
+  2026-08-18: content-hash ETag + `no-cache`, revalidations answer 304.
 
 ## 6. Permissions / users
 
@@ -326,8 +334,10 @@ sized pty: rendering, formula markers, and mid-session SSE updates
 re-rendering recomputed values.
 
 Remaining polish (small, as wanted):
-- Formula markers can go stale between snapshots when *another* client
-  creates/deletes formulas (values stay live; only the ƒ badge lags).
+- ~~Formula markers can go stale between snapshots~~ — improved
+  2026-08-18: markers now come from `GET /formulas` (tiny, off the
+  index, no raw-tree fetch) and refresh on change events with a 1s
+  debounce; residual staleness is at most that debounce.
 - Capability-driven greyout arrives with #4/#6, same as the web UI.
 - Array element insert-at-index (only append today); copy/yank.
 

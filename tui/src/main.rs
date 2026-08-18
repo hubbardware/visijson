@@ -160,25 +160,27 @@ fn parse_frame(frame: &str) -> Option<(String, Option<u64>, Value)> {
     Some((name?, id, data?))
 }
 
-/// Walk a raw (`?raw=true`) tree collecting the pointers of formula nodes.
-fn collect_formulas(raw: &Value, ptr: &str, out: &mut HashSet<String>) {
-    match raw {
-        Value::Object(m) => {
-            if m.contains_key("$formula") {
-                out.insert(ptr.to_string());
-                return; // cached $value is derived, not part of the tree
-            }
-            for (k, v) in m {
-                collect_formulas(v, &format!("{ptr}/{}", escape_token(k)), out);
-            }
-        }
-        Value::Array(a) => {
-            for (i, v) in a.iter().enumerate() {
-                collect_formulas(v, &format!("{ptr}/{i}"), out);
-            }
-        }
-        _ => {}
-    }
+/// Fetch the formula locations from `GET /formulas` (path + expression off
+/// the server's formula index — tiny, no tree walk).
+fn fetch_formula_markers(agent: &ureq::Agent, base: &str) -> Option<HashSet<String>> {
+    let body: Value = agent
+        .get(&format!("{base}/formulas"))
+        .set("Accept", "application/json")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    parse_formula_listing(&body)
+}
+
+fn parse_formula_listing(body: &Value) -> Option<HashSet<String>> {
+    Some(
+        body["formulas"]
+            .as_array()?
+            .iter()
+            .filter_map(|f| Some(f["path"].as_str()?.to_string()))
+            .collect(),
+    )
 }
 
 /// Subscribe forever: connect, stream frames, reconnect with Last-Event-ID.
@@ -187,6 +189,7 @@ fn feed_thread(base: String, tx: mpsc::Sender<Feed>, last_seen: Arc<AtomicU64>) 
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(3))
         .build();
+    let mut last_markers = std::time::Instant::now() - Duration::from_secs(10);
     loop {
         let mut req = agent
             .get(&format!("{base}/doc"))
@@ -230,24 +233,25 @@ fn feed_thread(base: String, tx: mpsc::Sender<Feed>, last_seen: Arc<AtomicU64>) 
                             value: data["value"].clone(),
                             resync: data["resync"].as_bool().unwrap_or(false),
                         });
-                        // Formula markers ride a raw read (SSE carries plain
-                        // values only); best-effort, staleness is cosmetic.
-                        if let Ok(raw) = agent
-                            .get(&format!("{base}/doc?raw=true"))
-                            .set("Accept", "application/json")
-                            .call()
-                            .and_then(|r| Ok(r.into_json::<Value>()?))
-                        {
-                            let mut set = HashSet::new();
-                            collect_formulas(&raw, "", &mut set);
+                        if let Some(set) = fetch_formula_markers(&agent, &base) {
                             let _ = tx.send(Feed::Formulas(set));
                         }
+                        last_markers = std::time::Instant::now();
                     }
                     "change" => {
                         let _ = tx.send(Feed::Change {
                             version: data["version"].as_u64().unwrap_or(0),
                             patch: data["patch"].as_array().cloned().unwrap_or_default(),
                         });
+                        // SSE carries plain values only, so a change may have
+                        // created or deleted formulas invisibly; refresh the
+                        // markers, debounced so busy streams stay cheap.
+                        if last_markers.elapsed() > Duration::from_secs(1) {
+                            if let Some(set) = fetch_formula_markers(&agent, &base) {
+                                let _ = tx.send(Feed::Formulas(set));
+                            }
+                            last_markers = std::time::Instant::now();
+                        }
                     }
                     _ => {}
                 }
@@ -866,14 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn formula_markers_from_raw_tree() {
-        let raw = json!({
-            "a": {"$formula": "/x + 1", "$value": 2},
-            "nest": {"b": {"$formula": "sum(/xs)", "$value": 0}},
-            "plain": 1,
+    fn formula_markers_from_listing() {
+        let body = json!({
+            "version": 9,
+            "formulas": [
+                {"path": "/a", "expr": "/x + 1"},
+                {"path": "/nest/b", "expr": "sum(/xs)"},
+            ],
         });
-        let mut set = HashSet::new();
-        collect_formulas(&raw, "", &mut set);
-        assert_eq!(set, HashSet::from(["/a".to_string(), "/nest/b".to_string()]));
+        assert_eq!(
+            parse_formula_listing(&body).unwrap(),
+            HashSet::from(["/a".to_string(), "/nest/b".to_string()])
+        );
     }
 }

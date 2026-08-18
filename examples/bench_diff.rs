@@ -66,6 +66,32 @@ fn main() {
     store.put("/players/u00042/field_007", json!(1)).unwrap();
     println!("single-field PUT:                    {:?}", t.elapsed());
 
+    // REST bodies: the reconciling deserializer parses against the current
+    // subtree, so an almost-unchanged poll body arrives pre-shared and the
+    // commit's reconcile/diff short-circuit on pointer equality.
+    let mut d1 = players.clone();
+    d1["u12000"]["field_010"] = json!("rest1");
+    let body1 = serde_json::to_vec(&d1).unwrap();
+    let t = Instant::now();
+    let plain: visijson::Node = serde_json::from_slice(&body1).unwrap();
+    let parse_plain = t.elapsed();
+    let t = Instant::now();
+    store.put_node("/players", std::sync::Arc::new(plain)).unwrap();
+    let commit_plain = t.elapsed();
+
+    let mut d2 = players.clone();
+    d2["u12000"]["field_010"] = json!("rest2");
+    let body2 = serde_json::to_vec(&d2).unwrap();
+    let t = Instant::now();
+    let hint = store.get_node("/players").unwrap();
+    let node = visijson::model::node_from_slice_reconciling(&body2, hint.as_ref()).unwrap();
+    let parse_rec = t.elapsed();
+    let t = Instant::now();
+    store.put_node("/players", node).unwrap();
+    let commit_rec = t.elapsed();
+    println!("REST full-replace, plain parse:      {parse_plain:?} parse + {commit_plain:?} commit");
+    println!("REST full-replace, reconciling:      {parse_rec:?} parse + {commit_rec:?} commit");
+
     // Where does single-field commit time go? Time the formula sweep alone.
     let head = store.head();
     let changed: std::collections::BTreeSet<_> =

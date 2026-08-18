@@ -182,6 +182,186 @@ impl<'de> serde::Deserialize<'de> for Node {
     }
 }
 
+/// Deserialize a JSON body straight into a node tree while **reconciling
+/// against `hint`** — the subtree the value is about to replace. Wherever
+/// the parsed content equals the hint, the hint's existing `Arc`s are
+/// returned instead of fresh allocations, so a poll-style full replace
+/// arrives already sharing structure with the current tree and everything
+/// downstream (commit-time reconcile, diff, formula overlap) short-circuits
+/// on pointer equality. The hint is purely an optimization: a mismatched or
+/// stale hint just yields fresh nodes, and commit-time `reconcile` remains
+/// the correctness authority. Formula shapes (`{"$formula": ...}`) parse
+/// exactly as `Node`'s `Deserialize` does.
+pub fn node_from_slice_reconciling(
+    bytes: &[u8],
+    hint: Option<&Arc<Node>>,
+) -> serde_json::Result<Arc<Node>> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let node = ReconcileSeed { hint }.deserialize(&mut de)?;
+    de.end()?;
+    Ok(node)
+}
+
+struct ReconcileSeed<'a> {
+    hint: Option<&'a Arc<Node>>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ReconcileSeed<'_> {
+    type Value = Arc<Node>;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<Arc<Node>, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl ReconcileSeed<'_> {
+    /// Reuse the hint `Arc` when the parsed scalar equals it.
+    fn scalar(self, n: Node) -> Arc<Node> {
+        if let Some(h) = self.hint {
+            if nodes_equal_shallow(h, &n) {
+                return h.clone();
+            }
+        }
+        Arc::new(n)
+    }
+}
+
+/// Scalar-only equality (no recursion): used by the reconciling
+/// deserializer to decide whether a freshly parsed leaf can reuse the
+/// hint's `Arc`.
+fn nodes_equal_shallow(a: &Node, b: &Node) -> bool {
+    match (a, b) {
+        (Node::Null, Node::Null) => true,
+        (Node::Bool(x), Node::Bool(y)) => x == y,
+        (Node::Number(x), Node::Number(y)) => x == y,
+        (Node::String(x), Node::String(y)) => x == y,
+        _ => false,
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ReconcileSeed<'_> {
+    type Value = Arc<Node>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<Arc<Node>, E> {
+        Ok(self.scalar(Node::Bool(v)))
+    }
+    fn visit_i64<E>(self, v: i64) -> std::result::Result<Arc<Node>, E> {
+        Ok(self.scalar(Node::Number(Number::from(v))))
+    }
+    fn visit_u64<E>(self, v: u64) -> std::result::Result<Arc<Node>, E> {
+        Ok(self.scalar(Node::Number(Number::from(v))))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Arc<Node>, E> {
+        let n = Number::from_f64(v).ok_or_else(|| E::custom("non-finite number"))?;
+        Ok(self.scalar(Node::Number(n)))
+    }
+    fn visit_str<E>(self, v: &str) -> std::result::Result<Arc<Node>, E> {
+        if let Some(h) = self.hint {
+            if matches!(&**h, Node::String(s) if s == v) {
+                return Ok(h.clone());
+            }
+        }
+        Ok(Arc::new(Node::String(v.to_owned())))
+    }
+    fn visit_string<E>(self, v: String) -> std::result::Result<Arc<Node>, E> {
+        Ok(self.scalar(Node::String(v)))
+    }
+    fn visit_unit<E>(self) -> std::result::Result<Arc<Node>, E> {
+        Ok(self.scalar(Node::Null))
+    }
+    fn visit_none<E>(self) -> std::result::Result<Arc<Node>, E> {
+        Ok(self.scalar(Node::Null))
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<Arc<Node>, D::Error> {
+        use serde::de::DeserializeSeed;
+        self.deserialize(d)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Arc<Node>, A::Error> {
+        let hint_items = match self.hint.map(|h| &**h) {
+            Some(Node::Array(items)) => Some(items),
+            _ => None,
+        };
+        let mut out: Vec<Arc<Node>> = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        loop {
+            let child_hint = hint_items.and_then(|it| it.get(out.len()));
+            match seq.next_element_seed(ReconcileSeed { hint: child_hint })? {
+                Some(n) => out.push(n),
+                None => break,
+            }
+        }
+        if let (Some(h), Some(items)) = (self.hint, hint_items) {
+            if items.len() == out.len() && out.iter().zip(items).all(|(a, b)| Arc::ptr_eq(a, b)) {
+                return Ok(h.clone());
+            }
+        }
+        Ok(Arc::new(Node::Array(out)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut access: A,
+    ) -> std::result::Result<Arc<Node>, A::Error> {
+        let (hint_obj, hint_formula) = match self.hint.map(|h| &**h) {
+            Some(Node::Object(m)) => (Some(m), None),
+            Some(Node::Formula(f)) => (None, Some(f)),
+            _ => (None, None),
+        };
+        let mut map = OrdMap::new();
+        while let Some(key) = access.next_key::<String>()? {
+            // If this turns out to be a formula shape, its `$value` child
+            // reconciles against the hint formula's cached subtree.
+            let child_hint = if key == FORMULA_VALUE_KEY {
+                hint_formula
+                    .map(|f| &f.cached)
+                    .or_else(|| hint_obj.and_then(|m| m.get(&key)))
+            } else {
+                hint_obj.and_then(|m| m.get(&key))
+            };
+            let node = access.next_value_seed(ReconcileSeed { hint: child_hint })?;
+            map.insert(key, node);
+        }
+        if let Some(expr) = map.get(FORMULA_KEY).and_then(|n| match &**n {
+            Node::String(s) => Some(s.clone()),
+            _ => None,
+        }) {
+            let cached = map
+                .get(FORMULA_VALUE_KEY)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Node::Null));
+            if let (Some(h), Some(f)) = (self.hint, hint_formula) {
+                if f.expr == expr && Arc::ptr_eq(&f.cached, &cached) {
+                    return Ok(h.clone());
+                }
+            }
+            return Ok(Arc::new(Node::Formula(FormulaNode { expr, cached })));
+        }
+        if let (Some(h), Some(hm)) = (self.hint, hint_obj) {
+            if hm.len() == map.len()
+                && map
+                    .iter()
+                    .all(|(k, v)| hm.get(k).is_some_and(|hv| Arc::ptr_eq(hv, v)))
+            {
+                return Ok(h.clone());
+            }
+        }
+        Ok(Arc::new(Node::Object(map)))
+    }
+}
+
 /// Serialize an `Arc<Node>` in **plain** form: formulas replaced by their
 /// cached values — what readers see. The streaming twin of `to_plain_value`.
 pub struct PlainView(pub Arc<Node>);
@@ -782,4 +962,75 @@ pub fn walk<'a>(root: &'a Arc<Node>, mut visit: impl FnMut(&[Cow<'a, str>], &'a 
         }
     }
     rec(root, &mut Vec::new(), &mut visit);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(v: &serde_json::Value, hint: Option<&Arc<Node>>) -> Arc<Node> {
+        node_from_slice_reconciling(&serde_json::to_vec(v).unwrap(), hint).unwrap()
+    }
+
+    #[test]
+    fn reconciling_parse_of_identical_body_returns_the_hint_root() {
+        let old = from_value(&json!({"a": {"b": [1, 2]}, "s": "x", "n": null}));
+        let new = parse(&json!({"a": {"b": [1, 2]}, "s": "x", "n": null}), Some(&old));
+        assert!(Arc::ptr_eq(&old, &new));
+    }
+
+    #[test]
+    fn reconciling_parse_shares_untouched_siblings() {
+        let old = from_value(&json!({"keep": {"big": [1, 2, 3]}, "change": 1}));
+        let new = parse(&json!({"keep": {"big": [1, 2, 3]}, "change": 2}), Some(&old));
+        assert!(!Arc::ptr_eq(&old, &new));
+        let (Node::Object(o), Node::Object(n)) = (&*old, &*new) else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(o.get("keep").unwrap(), n.get("keep").unwrap()));
+        assert!(!Arc::ptr_eq(o.get("change").unwrap(), n.get("change").unwrap()));
+    }
+
+    #[test]
+    fn reconciling_parse_handles_hint_shape_mismatches() {
+        // Hint is an object, body is an array (and vice versa): plain parse.
+        let old = from_value(&json!({"a": 1}));
+        let new = parse(&json!([1, 2]), Some(&old));
+        assert!(matches!(&*new, Node::Array(items) if items.len() == 2));
+        let old = from_value(&json!([1, 2]));
+        let new = parse(&json!({"a": 1}), Some(&old));
+        assert!(matches!(&*new, Node::Object(_)));
+        // No hint at all matches the plain deserializer.
+        let plain: Node = serde_json::from_slice(b"{\"x\":[true,null]}").unwrap();
+        let seeded = parse(&json!({"x": [true, null]}), None);
+        assert!(nodes_equal(&Arc::new(plain), &seeded));
+    }
+
+    #[test]
+    fn reconciling_parse_preserves_formula_shapes() {
+        let old = from_value(&json!({"f": {"$formula": "/a + 1", "$value": 2}, "a": 1}));
+        // Identical formula reuses the whole node.
+        let new = parse(&json!({"f": {"$formula": "/a + 1", "$value": 2}, "a": 1}), Some(&old));
+        assert!(Arc::ptr_eq(&old, &new));
+        // A changed expression yields a fresh formula node.
+        let new = parse(&json!({"f": {"$formula": "/a + 2", "$value": 2}, "a": 1}), Some(&old));
+        let Node::Object(n) = &*new else { panic!() };
+        assert!(matches!(&**n.get("f").unwrap(), Node::Formula(f) if f.expr == "/a + 2"));
+        // A formula without hint still parses as a formula.
+        let fresh = parse(&json!({"$formula": "sum(/xs)"}), None);
+        assert!(matches!(&*fresh, Node::Formula(f) if f.expr == "sum(/xs)"));
+    }
+
+    #[test]
+    fn reconciling_parse_shares_array_prefixes() {
+        let old = from_value(&json!([{"a": 1}, {"b": 2}, {"c": 3}]));
+        let new = parse(&json!([{"a": 1}, {"b": 99}, {"c": 3}]), Some(&old));
+        let (Node::Array(o), Node::Array(n)) = (&*old, &*new) else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(&o[0], &n[0]));
+        assert!(!Arc::ptr_eq(&o[1], &n[1]));
+        assert!(Arc::ptr_eq(&o[2], &n[2]));
+    }
 }

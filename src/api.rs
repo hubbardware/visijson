@@ -7,6 +7,8 @@
 //!   PATCH  /doc[/{path}]            RFC 6902 subset: add/replace/remove/test
 //!   DELETE /doc/{path}              remove
 //!   POST   /txn                     {"ops": [...], "conditions": [...]}
+//!   GET    /formulas                every formula in the document
+//!                                   (path + expression, off the index)
 //!   GET    /info[/{path}]           server liveness metadata — a read-only
 //!                                   sibling namespace backed by its own
 //!                                   in-memory store, so its once-a-second
@@ -38,7 +40,7 @@ use serde_json::{json, Value};
 
 use crate::error::StoreError;
 use crate::meta::Stamp;
-use crate::model::{from_value, get_at, to_plain_value, Node, PlainView, Pointer};
+use crate::model::{self, from_value, get_at, to_plain_value, Node, PlainView, Pointer};
 use crate::store::{Condition, Op, Store};
 use crate::subscriptions::CommitEvent;
 
@@ -61,6 +63,7 @@ pub fn router(doc: Arc<Store>, info: Arc<Store>) -> Router {
                 .delete(delete_path),
         )
         .route("/txn", post(txn_handler))
+        .route("/formulas", get(formulas_handler))
         .with_state(doc)
         // /info is a sibling namespace over its own store, GET-only (reads,
         // the UI, and WebSocket subscriptions all negotiate off GET; writes
@@ -173,8 +176,31 @@ async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -
     // Browsers get the live UI for any path — even one that doesn't exist
     // yet, so you can navigate somewhere and create it. `?raw=true` stays
     // JSON as an escape hatch for looking at formulas from the address bar.
+    // The page is immutable per build, so it carries a content-hash ETag
+    // and revalidations answer 304.
     if !q.raw && wants_html(&headers) {
-        return Ok(Html(UI_HTML).into_response());
+        static UI_ETAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let etag = UI_ETAG.get_or_init(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            UI_HTML.hash(&mut h);
+            format!("\"ui-{:016x}\"", h.finish())
+        });
+        let matched = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|inm| {
+                inm.split(',')
+                    .any(|t| t.trim().strip_prefix("W/").unwrap_or(t.trim()) == etag)
+            });
+        let validators = [
+            (header::ETAG, etag.clone()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ];
+        if matched {
+            return Ok((StatusCode::NOT_MODIFIED, validators).into_response());
+        }
+        return Ok((validators, Html(UI_HTML)).into_response());
     }
     let Some(node) = store.get_node(&ptr)? else {
         return Err(ApiError(StoreError::NotFound(ptr)));
@@ -275,24 +301,44 @@ async fn write_one(
 async fn put_root(
     State(store): State<Arc<Store>>,
     headers: HeaderMap,
-    Json(node): Json<Node>,
+    body: axum::body::Bytes,
 ) -> ApiResult {
-    let value = Arc::new(node);
-    write_one(store, &headers, "", |path| Op::Put { path, value }).await
+    put_reconciling(store, &headers, String::new(), body).await
 }
 
 async fn put_path(
     State(store): State<Arc<Store>>,
     Path(path): Path<String>,
     headers: HeaderMap,
-    Json(node): Json<Node>,
+    body: axum::body::Bytes,
 ) -> ApiResult {
-    let value = Arc::new(node);
-    write_one(store, &headers, &pointer_of(&path), |path| Op::Put {
-        path,
-        value,
-    })
-    .await
+    let ptr = pointer_of(&path);
+    put_reconciling(store, &headers, ptr, body).await
+}
+
+/// PUT parses the body against the current subtree at the target path
+/// (`model::node_from_slice_reconciling`): an almost-unchanged poll-style
+/// body arrives already sharing structure with the tree, so commit-time
+/// reconcile/diff short-circuit on pointer equality. The hint is read
+/// before the commit loop and is purely an optimization — a stale hint
+/// just means less sharing, never a wrong result.
+async fn put_reconciling(
+    store: Arc<Store>,
+    headers: &HeaderMap,
+    ptr: String,
+    body: axum::body::Bytes,
+) -> ApiResult {
+    let conds = write_conditions(headers, &ptr);
+    Ok(Json(
+        commit_blocking(move || {
+            let hint = store.get_node(&ptr)?;
+            let value = model::node_from_slice_reconciling(&body, hint.as_ref())
+                .map_err(|e| StoreError::Unsupported(format!("invalid JSON body: {e}")))?;
+            store.commit(vec![Op::Put { path: ptr, value }], &conds)
+        })
+        .await?,
+    )
+    .into_response())
 }
 
 // ------------------------------------------------------------------ POST (append)
@@ -445,6 +491,21 @@ async fn txn_handler(State(store): State<Arc<Store>>, Json(req): Json<TxnRequest
         Json(commit_blocking(move || store.commit(req.ops, &req.conditions)).await?)
             .into_response(),
     )
+}
+
+// ------------------------------------------------------------------ /formulas
+
+/// Discovery: every formula in the document, path + expression, straight
+/// off the formula index carried in the committed head — no tree scan.
+/// Sorted by path.
+async fn formulas_handler(State(store): State<Arc<Store>>) -> ApiResult {
+    let head = store.head();
+    let formulas: Vec<Value> = head
+        .formulas
+        .iter()
+        .map(|(path, info)| json!({ "path": path.to_string(), "expr": info.expr }))
+        .collect();
+    Ok(Json(json!({ "version": head.version, "formulas": formulas })).into_response())
 }
 
 // ------------------------------------------------------------------ /info ticker
