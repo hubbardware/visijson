@@ -26,9 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("nofsync") | Ok("none") => visijson::Durability::NoFsync,
         _ => visijson::Durability::Sync,
     };
+    // REBASE=1 enables the lost-CAS rebase fast path (see StoreConfig).
+    let rebase_on_conflict = matches!(
+        std::env::var("REBASE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    );
     let cfg = StoreConfig {
         data_dir,
         durability,
+        rebase_on_conflict,
         ..StoreConfig::default()
     };
     let store = Store::open(cfg)?;

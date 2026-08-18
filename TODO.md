@@ -188,27 +188,30 @@ Measured (8 writers): Sync 270 → 1041 ops/s (4 rec/fsync; p50 30ms →
 
 ## 10. Commit rebase on CAS loss
 
-A CAS loser discards *everything* — path-copy, `reconcile`, `diff_paths`,
-formula work, `minimal_ops`, mod index — and redoes it. For a poll-style
-20k-object full replace that is ~400ms per lost race, which matters
-precisely in the mixed workload (a big periodic sync alongside small
-concurrent writes).
+**Done (2026-08-18), flag-gated** via `StoreConfig.rebase_on_conflict`
+(`REBASE=1` env), default **off** pending soak. When a Put/Merge-only
+commit loses the CAS, `Store::try_rebase` re-checks conditions against the
+winner's head and takes the fast path iff every scan-root subtree is
+`Arc::ptr_eq` between our base and the head (structural sharing makes
+"untouched" a free pointer comparison), our prepared formula index is
+ptr-identical to the base's (we touched no formulas, `FormulaIndex::
+same_as`), and no head formula is `any_affected_by` a scan root (covers a
+winner *adding* a formula reaching into our subtree). Then it splices the
+already-built subtree `Arc`s onto the head via `set_at` and reuses the
+computed changed paths and minimal WAL ops. Excluded cases fall back to
+full replay silently; `Append`/`Insert`/`Remove` are excluded up front
+(array positions derive from the base root). Transactions never rebase
+(their read-set was validated against the base).
 
-Instead of partitioning the tree by "owner" threads: when we lose to
-exactly one commit, and our ops are `Put`/`Merge` only, and the winner
-didn't touch our subtree, and no formulas are implicated on either side
-(#7's `FormulaIndex` queries make that check cheap), splice the
-already-built subtree `Arc` onto the new root via `set_at` and reuse the
-computed changed paths. Microseconds instead of a full replay. The
-"winner didn't touch it" check can be `Arc::ptr_eq` on the node at each of
-our scan roots between the base root and the winner's root — structural
-sharing means an untouched subtree is literally the same pointer, which is
-both free and impossible to over-approximate (idea 2026-08-17).
+Proven by `rebased_commits_equal_wal_replay`: 4 threads × 200 randomized
+Put/Merge (disjoint + contended + formula-covered regions) with rebase
+on, then WAL replay into a fresh store must be `nodes_equal` with the
+live head — replay is an independent implementation of the same
+semantics. Stress-ran 10× in release.
 
-Flag-gated, off by default until a randomized test proves rebased trees
-equal full WAL replay (`nodes_equal`) — WAL replay is an independent
-implementation of the same semantics, so it makes a strong oracle. Note the
-excluded cases are load-bearing: `Append`/`Insert`/`Remove` derive array
-positions from the base root, and a winner that *adds* a formula reaching
-into our subtree must invalidate us even though its changed path doesn't
-overlap ours.
+**Why the flag should probably default on after soak** (bench_write
+`mixed` section): one poll-style 2000×20 replacer racing 4 small writers
+— with rebase off the replacer **starves outright** (20/20 replaces
+exhaust the 64-retry cap; 10.5k CAS losses, zero successes; before #8's
+cap this spun forever), with rebase on it's 20/20 at ~7.8ms each.
+`Store::stats().rebases` tracks recoveries.

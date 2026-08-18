@@ -108,6 +108,12 @@ pub struct StoreConfig {
     pub durability: Durability,
     /// Max optimistic transaction retries before giving up.
     pub max_retries: u32,
+    /// On a lost CAS race, try to splice the already-prepared subtrees onto
+    /// the winner's root instead of redoing the whole preparation. Only
+    /// safe-provably-equivalent cases take the fast path (Put/Merge ops,
+    /// winner untouched our subtrees, no formulas implicated); everything
+    /// else silently falls back to full replay.
+    pub rebase_on_conflict: bool,
 }
 
 impl Default for StoreConfig {
@@ -116,6 +122,7 @@ impl Default for StoreConfig {
             data_dir: None,
             durability: Durability::Sync,
             max_retries: 64,
+            rebase_on_conflict: false,
         }
     }
 }
@@ -125,6 +132,7 @@ pub struct Store {
     hub: Arc<Hub>,
     persistence: Option<Persistence>,
     max_retries: u32,
+    rebase_on_conflict: bool,
     stats: Arc<Stats>,
 }
 
@@ -322,6 +330,7 @@ impl Store {
             hub,
             persistence,
             max_retries: cfg.max_retries,
+            rebase_on_conflict: cfg.rebase_on_conflict,
             stats,
         }))
     }
@@ -421,12 +430,19 @@ impl Store {
     /// guarantees they held at commit time. `Conflict` means a condition
     /// failed; CAS races are retried internally and never surface.
     pub fn commit(&self, ops: Vec<Op>, conditions: &[Condition]) -> Result<CommitInfo> {
+        // Rebase is only equivalence-provable for Put/Merge: array ops
+        // derive element positions from the base root, which a winner may
+        // have shifted.
+        let rebase = self.rebase_on_conflict
+            && ops
+                .iter()
+                .all(|op| matches!(op, Op::Put { .. } | Op::Merge { .. }));
         for attempt in 0..self.max_retries {
             let cur = self.current.load_full();
             check_conditions(&cur.root, conditions)?;
             // Commit time never runs backwards, whatever the wall clock does.
             let time_ms = now_ms().max(cur.time_ms);
-            match self.try_commit(&cur, &ops, time_ms)? {
+            match self.try_commit(&cur, &ops, time_ms, rebase.then_some(conditions))? {
                 Some(info) => return Ok(info),
                 None => backoff(attempt), // CAS lost; replay against new root
             }
@@ -443,12 +459,16 @@ impl Store {
     }
 
     /// Build the new root from `cur`, re-evaluate formulas, CAS. Returns
-    /// `Ok(None)` if the CAS lost the race.
+    /// `Ok(None)` if the CAS lost the race and could not rebase.
+    /// `rebase_conditions` being `Some` allows the lost-CAS rebase fast
+    /// path, and carries the commit's preconditions for re-validation
+    /// against the winner's root.
     fn try_commit(
         &self,
         cur: &Arc<Committed>,
         ops: &[Op],
         time_ms: u64,
+        rebase_conditions: Option<&[Condition]>,
     ) -> Result<Option<CommitInfo>> {
         // A broken WAL fail-stops writes before any state changes hands —
         // a commit that could never recover must not CAS in.
@@ -471,8 +491,7 @@ impl Store {
         // WAL the effect, not the request: a whole-subtree PUT that changed
         // three fields records three small ops, not the whole subtree.
         let wal_ops = minimal_ops(&root, &changed);
-        let mut all = changed;
-        all.extend(fchanged);
+        let all: BTreeSet<Pointer> = changed.iter().chain(fchanged.iter()).cloned().collect();
         let stamp = Stamp::new(cur.version + 1, time_ms);
         let next = Arc::new(Committed {
             version: stamp.version,
@@ -484,10 +503,104 @@ impl Store {
         let prev = self.current.compare_and_swap(cur, next.clone());
         if !Arc::ptr_eq(&prev, cur) {
             Stats::bump(&self.stats.cas_losses);
+            if let Some(conditions) = rebase_conditions {
+                // Our writes touched no formulas (index untouched, nothing
+                // re-evaluated) — the remaining checks are per-subtree and
+                // live in try_rebase.
+                if fchanged.is_empty() && next.formulas.same_as(&cur.formulas) {
+                    if let Some(info) = self.try_rebase(
+                        cur, &prev, conditions, &next.root, &changed, &scan_roots, wal_ops,
+                        time_ms,
+                    )? {
+                        return Ok(Some(info));
+                    }
+                }
+            }
             return Ok(None);
         }
         Stats::bump(&self.stats.commits);
         let changed_paths = Arc::new(all.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        self.publish(next, changed_paths, wal_ops).map(Some)
+    }
+
+    /// The lost-CAS fast path: if the winner's head still shares every
+    /// subtree we wrote with our base (`Arc::ptr_eq` — structural sharing
+    /// makes "untouched" a pointer comparison), and no formula in the head
+    /// would be dirtied by our writes, then applying our ops to the head
+    /// would rebuild byte-identical subtrees — so splice the ones we
+    /// already built onto the head's root and reuse the computed diff and
+    /// minimal WAL ops. Microseconds instead of redoing a full replay.
+    /// Any surprise (structure changed, conditions now conflict-adjacent,
+    /// another race) falls back to `None` = full replay.
+    #[allow(clippy::too_many_arguments)]
+    fn try_rebase(
+        &self,
+        base: &Arc<Committed>,
+        head: &Arc<Committed>,
+        conditions: &[Condition],
+        prepared_root: &Arc<Node>,
+        changed: &BTreeSet<Pointer>,
+        scan_roots: &[Pointer],
+        wal_ops: Vec<Op>,
+        time_ms: u64,
+    ) -> Result<Option<CommitInfo>> {
+        // Preconditions were validated against `base`; the winner may have
+        // invalidated them. A failure here is a real conflict, not a race.
+        check_conditions(&head.root, conditions)?;
+        for sr in scan_roots {
+            let untouched = matches!(
+                (get_at(&base.root, sr), get_at(&head.root, sr)),
+                (Some(a), Some(b)) if Arc::ptr_eq(&a, &b)
+            );
+            if !untouched {
+                // The winner wrote into (or around) this subtree, or our op
+                // created it fresh — replay to re-derive against the head.
+                return Ok(None);
+            }
+            if head.formulas.any_affected_by(sr) {
+                // A head formula (possibly one the winner just added) reads
+                // from this subtree; replay so it re-evaluates.
+                return Ok(None);
+            }
+        }
+        let mut root = head.root.clone();
+        for sr in scan_roots {
+            let Some(sub) = get_at(prepared_root, sr) else {
+                return Ok(None);
+            };
+            match set_at(&root, sr, sub) {
+                Ok(r) => root = r,
+                Err(_) => return Ok(None), // structural surprise — replay
+            }
+        }
+        let time_ms = time_ms.max(head.time_ms);
+        let stamp = Stamp::new(head.version + 1, time_ms);
+        let next = Arc::new(Committed {
+            version: stamp.version,
+            time_ms,
+            root,
+            formulas: head.formulas.clone(),
+            mods: head.mods.record(stamp, changed.iter()),
+        });
+        let prev = self.current.compare_and_swap(head, next.clone());
+        if !Arc::ptr_eq(&prev, head) {
+            Stats::bump(&self.stats.cas_losses);
+            return Ok(None); // lost again — take the full path
+        }
+        Stats::bump(&self.stats.rebases);
+        Stats::bump(&self.stats.commits);
+        let changed_paths = Arc::new(changed.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        self.publish(next, changed_paths, wal_ops).map(Some)
+    }
+
+    /// Post-CAS tail shared by the normal and rebase paths: hand the record
+    /// to the WAL writer in version order, wait for durability, report.
+    fn publish(
+        &self,
+        next: Arc<Committed>,
+        changed_paths: Arc<Vec<String>>,
+        wal_ops: Vec<Op>,
+    ) -> Result<CommitInfo> {
         let pending = Pending {
             committed: next.clone(),
             changed_paths: changed_paths.clone(),
@@ -516,10 +629,10 @@ impl Store {
             persistence.wait_durable(next.version)?;
         }
         tracing::debug!(version = next.version, changed = ?changed_paths, "commit");
-        Ok(Some(CommitInfo {
+        Ok(CommitInfo {
             version: next.version,
             changed_paths: changed_paths.as_ref().clone(),
-        }))
+        })
     }
 
     /// Run an optimistic transaction. The closure reads and writes through
@@ -585,7 +698,9 @@ impl Store {
                 }
             }
             let time_ms = now_ms().max(cur.time_ms);
-            match self.try_commit(&cur, ops, time_ms)? {
+            // No rebase here: the read-set was validated against `cur`, and
+            // rebasing onto a newer head would skip that validation.
+            match self.try_commit(&cur, ops, time_ms, None)? {
                 Some(info) => return Ok(info),
                 None => continue,
             }

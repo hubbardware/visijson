@@ -505,6 +505,26 @@ impl FormulaIndex {
         self.formulas.iter()
     }
 
+    /// O(1): do these two indexes share the same underlying maps? True
+    /// exactly when the `update_index` that produced one from the other
+    /// removed, added, and changed no formulas (a no-op update returns an
+    /// untouched clone of the same persistent maps).
+    pub fn same_as(&self, other: &FormulaIndex) -> bool {
+        self.formulas.ptr_eq(&other.formulas) && self.rev.ptr_eq(&other.rev)
+    }
+
+    /// Would a write at `p` dirty any formula — own path or declared
+    /// dependency overlapping `p`? The commit-rebase fast path declines
+    /// whenever this is true for a written subtree.
+    pub fn any_affected_by(&self, p: &Pointer) -> bool {
+        let mut hit = false;
+        overlapping(&self.formulas, p, |_, _| hit = true);
+        if !hit {
+            overlapping(&self.rev, p, |_, _| hit = true);
+        }
+        hit
+    }
+
     fn insert(&mut self, path: Pointer, info: Arc<FormulaInfo>) {
         for d in &info.deps {
             self.rev.entry(d.clone()).or_default().insert(path.clone());

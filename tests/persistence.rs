@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use visijson::store::{Store, StoreConfig};
 use visijson::Durability;
@@ -313,6 +313,75 @@ fn legacy_single_file_wal_is_still_replayed() {
     drop(store);
     let store = open(dir.path());
     assert_eq!(store.version(), 3);
+}
+
+#[test]
+fn rebased_commits_equal_wal_replay() {
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(StoreConfig {
+        data_dir: Some(dir.path().to_path_buf()),
+        durability: Durability::NoFsync,
+        rebase_on_conflict: true,
+        ..StoreConfig::default()
+    })
+    .unwrap();
+    // A formula depending on the shared region: writes there must decline
+    // the rebase fast path and take the full replay route.
+    store.put("/shared", json!({"k0": 0})).unwrap();
+    store.put("/calc/total", json!({"$formula": "sum(/shared)"})).unwrap();
+
+    // Randomized concurrent Put/Merge: mostly per-thread subtrees (where
+    // rebase applies), some contended/formula-covered writes (where it must
+    // decline), some merges.
+    std::thread::scope(|s| {
+        for t in 0..4u64 {
+            let store = store.clone();
+            s.spawn(move || {
+                let mut seed = (t + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                for i in 0..200u64 {
+                    let r = xorshift(&mut seed);
+                    match r % 100 {
+                        0..=69 => {
+                            store.put(&format!("/t{t}/k{}", r % 20), json!(i)).unwrap();
+                        }
+                        70..=84 => {
+                            store.put(&format!("/shared/k{}", r % 5), json!(i)).unwrap();
+                        }
+                        _ => {
+                            let mut m = serde_json::Map::new();
+                            m.insert(format!("m{}", r % 3), json!(i));
+                            store.merge(&format!("/t{t}"), Value::Object(m)).unwrap();
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let live = store.head();
+    let stats = store.stats();
+    assert!(
+        stats.rebases > 0,
+        "rebase path never exercised (cas_losses={})",
+        stats.cas_losses
+    );
+    drop(store);
+
+    // WAL replay is an independent implementation of the same semantics —
+    // recovery must rebuild the exact tree the rebased commits produced.
+    let recovered = open(dir.path());
+    assert_eq!(recovered.version(), live.version);
+    assert!(
+        visijson::model::nodes_equal(&recovered.head().root, &live.root),
+        "recovered tree differs from live tree after rebased commits"
+    );
 }
 
 #[test]

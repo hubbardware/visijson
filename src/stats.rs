@@ -13,8 +13,12 @@ pub struct Stats {
     pub(crate) commits: AtomicU64,
     /// Commits elided because they changed nothing.
     pub(crate) elided: AtomicU64,
-    /// CAS races lost (each one redid the whole commit preparation).
+    /// CAS races lost (each one redid the whole commit preparation, unless
+    /// it rebased).
     pub(crate) cas_losses: AtomicU64,
+    /// CAS losses recovered by splicing the prepared subtrees onto the new
+    /// head instead of replaying the whole preparation.
+    pub(crate) rebases: AtomicU64,
     /// WAL records appended.
     pub(crate) wal_records: AtomicU64,
     /// WAL fsync calls issued.
@@ -39,6 +43,7 @@ impl Stats {
             commits: self.commits.load(Ordering::Relaxed),
             elided: self.elided.load(Ordering::Relaxed),
             cas_losses: self.cas_losses.load(Ordering::Relaxed),
+            rebases: self.rebases.load(Ordering::Relaxed),
             wal_records: self.wal_records.load(Ordering::Relaxed),
             wal_fsyncs: self.wal_fsyncs.load(Ordering::Relaxed),
             snapshots: self.snapshots.load(Ordering::Relaxed),
@@ -53,6 +58,7 @@ pub struct StatsSnapshot {
     pub commits: u64,
     pub elided: u64,
     pub cas_losses: u64,
+    pub rebases: u64,
     pub wal_records: u64,
     pub wal_fsyncs: u64,
     pub snapshots: u64,
