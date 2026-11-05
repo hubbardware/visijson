@@ -202,10 +202,93 @@ Still open (cosmetic / revisit-if-hit):
 
 ## 6. Permissions / users
 
-Eventually needed. No design yet — auth on the HTTP layer, per-path ACLs on
-the store, or both. Interacts with #2 (who can create/see a view), #4 (the
-UI reflecting the user's rights), and #1 (metadata namespace probably
-shouldn't be writable by clients at all).
+**Design settled (2026-11-05).** Single tenant — multi-tenancy (orgs with
+fully separate data) is explicitly out of scope; one tree, path grants.
+
+**Identity model: a principal with many credentials.** Authorization only
+ever sees the principal; how it authenticated is a detail of the request.
+- `Principal { id, kind: human | service, display, status: active |
+  disabled, groups }`. Service accounts are principals with only keys/mTLS.
+- Credential kinds, many per principal: `password` (username + argon2id),
+  `api_key` (`vjk_<id>_<secret>`, sha256-hashed, shown once, optional
+  scope + expiry), `oidc` (issuer, subject — Google, any OIDC provider),
+  `oauth` (non-OIDC providers like Facebook via an adapter), `passkey`
+  (WebAuthn), `mtls` (CA + SAN, or SPKI fingerprint).
+- **Key external identities on `(issuer, subject)`, never on email** —
+  auto-merging by email is the classic account-takeover hole. Linking a new
+  credential only happens from an already-authenticated session; unlinking
+  must leave at least one credential.
+- **We mint our own sessions**: provider tokens are used once at login and
+  discarded. Sessions are opaque, server-side, revocable (`vjs_…`);
+  browsers get an HttpOnly SameSite=Strict cookie, programs a Bearer token.
+- API keys can only narrow their principal's rights (scope ∩ grants),
+  never widen them.
+
+**Request pipeline.** An axum middleware resolves whichever credential the
+request carries (Bearer session/key, cookie, single-use `?ticket=`) into a
+`Caller` placed in request extensions; no credential = the built-in
+`anonymous` principal. Handlers never know the method. Browser specifics:
+`EventSource` can't set headers → cookie, or a 30s single-use ticket from
+`POST /auth/ticket`; cookie-authenticated WebSocket upgrades must pass an
+`Origin` check (CSWSH); cookie-authenticated writes require the
+`X-VisiJson-Request` header (cross-origin pages can't set it without a CORS
+preflight we never grant). Anonymous denial is 401, authenticated denial
+403.
+
+**Storage: a third `Store` (`sys`), never routed directly.** Principals,
+credential lookups, sessions, tickets, grants. Durability, CAS, uniqueness
+(conditions on lookup keys) for free. Persisted under `DATA_DIR/sys`.
+Secrets stored hashed only.
+
+**Authorization: per-path grants.** `(principal | group) × path × {read,
+write, formula, admin}`; a grant covers its whole subtree. Pseudo-groups
+`anonymous` (everyone) and `authenticated` (anyone logged in). The ACL view
+is rebuilt from the sys store lazily, keyed by sys version.
+1. **Writes authorize on the effect.** The store's `WriteGuard` hook runs
+   inside the commit loop after the diff, before the CAS (so it holds
+   across rebase), and checks `write` on every *changed path* — not the
+   request URL. A poll-style full PUT at `/` that only changes
+   `/teamA/score` passes for a holder of write on `/teamA`. Diff collapse
+   (`MAX_DIFF_PATHS`) only coarsens paths → spurious *deny*, never allow.
+   Formula re-evaluation changes are exempt. **Oracle guard:** an op whose
+   target the caller can't write must at least be readable — otherwise
+   accept/deny of a guessed full replace would leak values. Elided
+   (no-change) commits are covered by the same op-level check.
+2. **Formulas run with the definer's rights.** A computed value is
+   evaluated once and shared, so it cannot depend on the reader. Creating
+   or changing a formula needs `formula` on its path and `read` on every
+   dependency (the jq scope pointer included). This is what makes views
+   (#2) useful: publish `/leaderboard`, hide `/raw_scores`. Phase 4 adds
+   recorded ownership so a definer losing access turns the formula `#ERR`.
+3. **No holes (v1).** Reading P requires a grant on P or an ancestor —
+   no per-subscriber redaction, so the shared event stream survives.
+   `GET /auth/whoami` lists your grants so clients can navigate.
+4. **Side channels:** `/txn` conditions and `If-Match` need read (they
+   reveal values/timing); `GET /formulas` is filtered by read; ETags and
+   versions leak activity timing (accepted, documented).
+5. `formula` is separate from `write`: jq burns CPU inside the commit.
+6. **Revocation of live streams:** WS/SSE tasks watch the sys store and
+   re-validate their caller on every sys commit and at session expiry,
+   closing the stream when the credential or the grant is gone.
+
+**Also:** every WAL record carries `actor` (audit trail; later a per-path
+last-writer beside `ModIndex`). Bootstrap: with auth on and no principals,
+startup mints a one-time admin API key and logs it. `AUTH=off` (default)
+keeps today's behavior — everyone unrestricted, zero cost. The library
+`Store` API stays unauthenticated; authorization is opt-in via
+`Store::commit_with`. Deleting a user removes their credentials and
+personal data. Later: per-principal quotas (write rate, doc size, jq CPU);
+federation (`remote()` formulas) authenticates server-to-server as
+service principals over mTLS / API keys.
+
+**Phasing:**
+1. Principals, passwords, sessions, API keys, tickets, the `sys` store, the
+   middleware, `AUTH` flag, bootstrap key, `actor` in the WAL.
+2. Path grants, effect-based write checks, read checks on every surface,
+   subscription revocation.
+3. OIDC (Google, generic), Facebook adapter, passkeys, account linking.
+4. Formula ownership + definer-rights revocation, `/views` (#2), UI/TUI
+   greyout (#4), mTLS.
 
 ---
 
