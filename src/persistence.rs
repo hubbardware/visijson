@@ -64,6 +64,10 @@ pub struct WalRecord {
     #[serde(default)]
     pub time_ms: u64,
     pub ops: Vec<Op>,
+    /// The principal that made the commit — an audit trail; replay
+    /// ignores it. Absent for anonymous/library commits and old records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 #[derive(Deserialize)]

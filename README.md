@@ -88,6 +88,7 @@ ignore it if you don't.
 cargo run                       # data in ./data, listens on 127.0.0.1:8080
 DATA_DIR=none cargo run         # pure in-memory
 ADDR=0.0.0.0:9000 SNAPSHOT_SECS=10 DATA_DIR=/var/lib/jds cargo run
+AUTH=on cargo run               # users + permissions (see "Users and permissions")
 ```
 
 ## API tour
@@ -310,6 +311,83 @@ every replayed commit — and always errs newer than the truth, so a stale
 `304` is impossible; the cost of imprecision is only a needless refetch.
 The same applies if the index hits its size cap and collapses to
 whole-store validators.
+
+## Users and permissions
+
+Off by default — every request is unrestricted, exactly as before. With
+`AUTH=on`, identities live in a separate store under `DATA_DIR/sys`
+(never routed directly; secrets stored only as hashes). On first start
+with no users, the server bootstraps an `admin` principal and logs its
+API key **once**:
+
+```sh
+AUTH=on cargo run
+# WARN … bootstrapped an admin. Its API key (shown once): vjk_…
+K=vjk_…   # the admin key
+
+# Create a user with a password, and grant them a subtree
+curl -X POST localhost:8080/auth/principals -H "Authorization: Bearer $K" \
+  -H 'content-type: application/json' \
+  -d '{"display":"Alice","username":"alice","password":"correct horse"}'
+# → {"id":"p_…"}
+curl -X POST localhost:8080/auth/grants -H "Authorization: Bearer $K" \
+  -H 'content-type: application/json' \
+  -d '{"subject":"principal:p_…","path":"/teamA","perms":["read","write"]}'
+
+# Log in → session token (also set as an HttpOnly cookie for the web UI)
+curl -X POST localhost:8080/auth/login -H 'content-type: application/json' \
+  -d '{"username":"alice","password":"correct horse"}'
+# → {"token":"vjs_…","principal":"p_…","expires_ms":…}
+
+# Mint a narrower API key for a dashboard (scope ∩ grants, never wider)
+curl -X POST localhost:8080/auth/keys -H "Authorization: Bearer vjs_…" \
+  -H 'content-type: application/json' \
+  -d '{"name":"dash","scope":[{"path":"/teamA","perms":["read"]}],"expires_in_secs":86400}'
+
+# Public read access: grant the built-in group
+#   {"subject":"group:anonymous","path":"/public","perms":["read"]}
+```
+
+**The model.** A *principal* (human or service) holds any number of
+*credentials* — today passwords and API keys; OIDC providers, passkeys,
+and mTLS slot in as more credential kinds. Authorization only sees the
+principal. A *grant* is `subject × path × perms` covering the whole
+subtree; subjects are `principal:<id>`, `group:<name>`, and the built-in
+`group:anonymous` (everyone) and `group:authenticated`. Perms are `read`,
+`write`, `formula`, and `admin` (implies all; on a path it lets you grant
+under it, on `/` it also manages principals).
+
+**Rules worth knowing:**
+- **No holes.** Reading a path needs a grant on it or an ancestor; a
+  grant on `/teamA` doesn't let you read `/`. `GET /auth/whoami` lists
+  your grants.
+- **Writes authorize on their effect.** The commit's actual changed paths
+  must all be writable — so a full-document PUT that only changes
+  `/teamA/score` is fine for a `/teamA` writer… provided they can *read*
+  the PUT's target. (Otherwise accept/deny would leak whether guessed
+  values elsewhere were right.)
+- **Formulas run with the definer's rights.** Creating or changing one
+  needs `formula` on its path and `read` on everything it references, so
+  a view at `/leaderboard` can publish aggregates of `/raw_scores` to
+  readers who can't see the raw data.
+- **Conditions need read** (`/txn` conditions, JSON Patch `test`,
+  `If-Match`) — they reveal values. `GET /formulas` lists only readable
+  formulas. ETags/versions reveal activity timing; that's accepted.
+- **Live streams are re-validated** on every identity change and at
+  credential expiry: revoke a key, a grant, or disable an account and its
+  WebSocket closes (code 1008, "access revoked") / its SSE stream ends.
+- **Credentials on the wire:** `Authorization: Bearer <vjs_…|vjk_…>`, the
+  `vj_session` cookie, or — for `EventSource`, which can't send headers —
+  a single-use `?ticket=` from `POST /auth/ticket` (30 s; good for one
+  connection, so fetch a fresh one per reconnect). Cookie-authenticated
+  writes must send `X-VisiJson-Request` (CSRF), and cookie WebSocket
+  upgrades must be same-origin. Set `COOKIE_SECURE=1` behind TLS;
+  `SESSION_TTL_SECS` defaults to 7 days.
+- Every WAL record carries the committing principal as `actor`.
+
+The TUI takes `--token` / `VISIJSON_TOKEN`. Full endpoint list:
+`src/auth/http.rs`; the design and its remaining phases (OIDC/Google,
+Facebook, passkeys, account linking, mTLS, formula ownership): `TODO.md` #6.
 
 ## Consistency model
 

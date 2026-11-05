@@ -525,6 +525,30 @@ impl FormulaIndex {
         hit
     }
 
+    /// Formulas at or under any of `scan_roots` that are new in `self`
+    /// relative to `prev`, or whose parsed info changed (an identical
+    /// re-write reuses the old `Arc`, so pointer identity means "same
+    /// expression"). Used by write guards; O(hits) via range scans.
+    pub fn written_since(
+        &self,
+        prev: &FormulaIndex,
+        scan_roots: &[Pointer],
+    ) -> Vec<(Pointer, Arc<FormulaInfo>)> {
+        let mut out: Vec<(Pointer, Arc<FormulaInfo>)> = Vec::new();
+        if self.same_as(prev) {
+            return out;
+        }
+        for sr in scan_roots {
+            overlapping(&self.formulas, sr, |k, info| {
+                let unchanged = prev.formulas.get(k).is_some_and(|old| Arc::ptr_eq(old, info));
+                if sr.is_prefix_of(k) && !unchanged && !out.iter().any(|(p, _)| p == k) {
+                    out.push((k.clone(), info.clone()));
+                }
+            });
+        }
+        out
+    }
+
     fn insert(&mut self, path: Pointer, info: Arc<FormulaInfo>) {
         for d in &info.deps {
             self.rev.entry(d.clone()).or_default().insert(path.clone());

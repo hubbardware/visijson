@@ -281,6 +281,21 @@ personal data. Later: per-principal quotas (write rate, doc size, jq CPU);
 federation (`remote()` formulas) authenticates server-to-server as
 service principals over mTLS / API keys.
 
+**Phases 1–2 done (2026-11-05):** `src/auth/` (`mod.rs` sys-store
+identity ops, `acl.rs` perms/grants/`Caller`/`WriteGuard`, `http.rs`
+middleware + `/auth/*`), `Store::commit_with` + `WriteGuard`/`WriteEffect`
+hook, `actor` in WAL records, UI sign-in dialog + CSRF header, TUI
+`--token`. Pinned by `tests/auth.rs`. Known gaps, small:
+- API-key `last_used` isn't tracked (a sys write per request would churn
+  the WAL; revisit with a coarse, batched stamp).
+- Every sys commit (incl. each login) re-validates every live stream —
+  cheap reads, but O(streams); index streams by principal if it shows.
+- The TUI always subscribes at the root, so a user with only subtree
+  grants gets 403 — it needs a start-path argument.
+- No CLI for admin recovery if the bootstrap key is lost (today: stop the
+  server, delete `DATA_DIR/sys`, restart → fresh bootstrap — which also
+  drops all users).
+
 **Phasing:**
 1. Principals, passwords, sessions, API keys, tickets, the `sys` store, the
    middleware, `AUTH` flag, bootstrap key, `actor` in the WAL.

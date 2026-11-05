@@ -19,7 +19,7 @@ use crate::error::{Result, StoreError};
 use crate::formulas;
 use crate::meta::{ModIndex, Stamp};
 use crate::model::{
-    self, empty_object, from_value, get_at, insert_at, nodes_equal, remove_at, set_at,
+    self, from_value, get_at, insert_at, nodes_equal, remove_at, set_at,
     to_plain_value, to_raw_value, Node, Pointer,
 };
 use crate::persistence::{Durability, Persistence, WalRecord};
@@ -134,6 +134,35 @@ impl Condition {
             unmodified_ms: None,
         }
     }
+}
+
+/// What a commit's ops actually did, handed to a `WriteGuard` after the
+/// diff and before the CAS. `changed` is the effect of the ops (precise
+/// diff paths, collapsed to coarser ancestors past `MAX_DIFF_PATHS` —
+/// never finer than the truth); formula re-evaluation is not included.
+pub struct WriteEffect<'a> {
+    pub ops: &'a [Op],
+    pub changed: &'a BTreeSet<Pointer>,
+    /// Formulas this commit created or whose expression it changed
+    /// (identical re-writes reuse the old parse and are not listed).
+    pub formulas_written: Vec<(Pointer, Arc<formulas::FormulaInfo>)>,
+}
+
+/// Authorization hook checked inside the commit loop — after the diff,
+/// before the CAS, so it holds for exactly the effect that commits
+/// (including across a rebase, which reuses the checked effect). An error
+/// rejects the commit.
+pub trait WriteGuard: Send + Sync {
+    fn check(&self, effect: &WriteEffect<'_>) -> Result<()>;
+}
+
+/// Per-commit context: who is writing (recorded in the WAL as `actor`)
+/// and an optional authorization guard. `Default` is the library path —
+/// anonymous and unguarded.
+#[derive(Default, Clone, Copy)]
+pub struct CommitCtx<'a> {
+    pub actor: Option<&'a str>,
+    pub guard: Option<&'a dyn WriteGuard>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -503,6 +532,17 @@ impl Store {
     /// guarantees they held at commit time. `Conflict` means a condition
     /// failed; CAS races are retried internally and never surface.
     pub fn commit(&self, ops: Vec<Op>, conditions: &[Condition]) -> Result<CommitInfo> {
+        self.commit_with(ops, conditions, CommitCtx::default())
+    }
+
+    /// `commit` with an actor (recorded in the WAL) and an optional
+    /// `WriteGuard` checked against the commit's effect.
+    pub fn commit_with(
+        &self,
+        ops: Vec<Op>,
+        conditions: &[Condition],
+        ctx: CommitCtx<'_>,
+    ) -> Result<CommitInfo> {
         // Rebase is only equivalence-provable for Put/Merge: array ops
         // derive element positions from the base root, which a winner may
         // have shifted.
@@ -515,7 +555,7 @@ impl Store {
             check_conditions(&cur, conditions)?;
             // Commit time never runs backwards, whatever the wall clock does.
             let time_ms = now_ms().max(cur.time_ms);
-            match self.try_commit(&cur, &ops, time_ms, rebase.then_some(conditions))? {
+            match self.try_commit(&cur, &ops, time_ms, rebase.then_some(conditions), ctx)? {
                 Some(info) => return Ok(info),
                 None => backoff(attempt), // CAS lost; replay against new root
             }
@@ -542,6 +582,7 @@ impl Store {
         ops: &[Op],
         time_ms: u64,
         rebase_conditions: Option<&[Condition]>,
+        ctx: CommitCtx<'_>,
     ) -> Result<Option<CommitInfo>> {
         // A broken WAL fail-stops writes before any state changes hands —
         // a commit that could never recover must not CAS in.
@@ -551,6 +592,13 @@ impl Store {
         }
         let (root, changed, scan_roots) = apply_ops(&cur.root, ops)?;
         let formulas = formulas::update_index(&cur.formulas, &scan_roots, &root)?;
+        if let Some(guard) = ctx.guard {
+            guard.check(&WriteEffect {
+                ops,
+                changed: &changed,
+                formulas_written: formulas.written_since(&cur.formulas, &scan_roots),
+            })?;
+        }
         let (root, fchanged) = formulas::reevaluate(&root, &changed, &formulas)?;
         // A commit that changed nothing (e.g. re-PUTting an identical
         // fetch) is elided entirely: no version bump, no WAL, no event.
@@ -583,7 +631,7 @@ impl Store {
                 if fchanged.is_empty() && next.formulas.same_as(&cur.formulas) {
                     if let Some(info) = self.try_rebase(
                         cur, &prev, conditions, &next.root, &changed, &scan_roots, wal_ops,
-                        time_ms,
+                        time_ms, ctx.actor,
                     )? {
                         return Ok(Some(info));
                     }
@@ -593,7 +641,7 @@ impl Store {
         }
         Stats::bump(&self.stats.commits);
         let changed_paths = Arc::new(all.iter().map(|p| p.to_string()).collect::<Vec<_>>());
-        self.publish(next, changed_paths, wal_ops).map(Some)
+        self.publish(next, changed_paths, wal_ops, ctx.actor).map(Some)
     }
 
     /// The lost-CAS fast path: if the winner's head still shares every
@@ -616,6 +664,7 @@ impl Store {
         scan_roots: &[Pointer],
         wal_ops: Vec<Op>,
         time_ms: u64,
+        actor: Option<&str>,
     ) -> Result<Option<CommitInfo>> {
         // Preconditions were validated against `base`; the winner may have
         // invalidated them. A failure here is a real conflict, not a race.
@@ -663,7 +712,7 @@ impl Store {
         Stats::bump(&self.stats.rebases);
         Stats::bump(&self.stats.commits);
         let changed_paths = Arc::new(changed.iter().map(|p| p.to_string()).collect::<Vec<_>>());
-        self.publish(next, changed_paths, wal_ops).map(Some)
+        self.publish(next, changed_paths, wal_ops, actor).map(Some)
     }
 
     /// Post-CAS tail shared by the normal and rebase paths: hand the record
@@ -673,11 +722,13 @@ impl Store {
         next: Arc<Committed>,
         changed_paths: Arc<Vec<String>>,
         wal_ops: Vec<Op>,
+        actor: Option<&str>,
     ) -> Result<CommitInfo> {
         let pending = Pending {
             committed: next.clone(),
             changed_paths: changed_paths.clone(),
             ops: wal_ops,
+            actor: actor.map(Arc::from),
         };
         // The sink hands the record (and its event) to the WAL writer in
         // version order; broadcast happens once the batch is durable. For
@@ -688,6 +739,7 @@ impl Store {
                     version: p.committed.version,
                     time_ms: p.committed.time_ms,
                     ops: p.ops.clone(),
+                    actor: p.actor.as_deref().map(String::from),
                 };
                 persistence.enqueue(&record, event.clone()).inspect_err(|e| {
                     tracing::error!(version = p.committed.version, error = %e,
@@ -773,7 +825,7 @@ impl Store {
             let time_ms = now_ms().max(cur.time_ms);
             // No rebase here: the read-set was validated against `cur`, and
             // rebasing onto a newer head would skip that validation.
-            match self.try_commit(&cur, ops, time_ms, None)? {
+            match self.try_commit(&cur, ops, time_ms, None, CommitCtx::default())? {
                 Some(info) => return Ok(info),
                 None => continue,
             }

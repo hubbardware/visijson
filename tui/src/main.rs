@@ -9,6 +9,7 @@
 //! Usage:
 //!   visijson-tui [http://127.0.0.1:8080]
 //!   visijson-tui --check [URL]   # headless: connect, print state, exit
+//!   visijson-tui --token vjk_… [URL]   # or VISIJSON_TOKEN=…; servers with AUTH=on
 //!
 //! Keys: ↑/k ↓/j move · ←/h →/l/Enter fold/unfold · e edit (`=expr` makes a
 //! formula, other input is JSON, bare words become strings) · a add child ·
@@ -26,6 +27,23 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use serde_json::{json, Value};
+
+// ------------------------------------------------------------- auth
+
+/// Bearer token (API key or session) for servers running with auth on.
+static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Every agent goes through here so every request carries the token.
+fn build_agent(builder: ureq::AgentBuilder) -> ureq::Agent {
+    match TOKEN.get().cloned().flatten() {
+        Some(token) => builder
+            .middleware(move |req: ureq::Request, next: ureq::MiddlewareNext| {
+                next.handle(req.set("Authorization", &format!("Bearer {token}")))
+            })
+            .build(),
+        None => builder.build(),
+    }
+}
 
 // ------------------------------------------------------------- JSON pointers
 
@@ -186,9 +204,7 @@ fn parse_formula_listing(body: &Value) -> Option<HashSet<String>> {
 /// Subscribe forever: connect, stream frames, reconnect with Last-Event-ID.
 /// After each snapshot, fetch the raw tree once to mark formula nodes.
 fn feed_thread(base: String, tx: mpsc::Sender<Feed>, last_seen: Arc<AtomicU64>) {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(3))
-        .build();
+    let agent = build_agent(ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(3)));
     let mut last_markers = std::time::Instant::now() - Duration::from_secs(10);
     loop {
         let mut req = agent
@@ -270,7 +286,7 @@ fn fetch_raw(agent: &ureq::Agent, base: &str, ptr: &str) -> Result<(String, Valu
         .get(&format!("{}?raw=true", url_of(base, ptr)))
         .set("Accept", "application/json")
         .call()
-        .map_err(|e| short_err(e))?;
+        .map_err(short_err)?;
     let etag = resp.header("etag").unwrap_or_default().to_string();
     let body = resp.into_json().map_err(|e| e.to_string())?;
     Ok((etag, body))
@@ -295,7 +311,7 @@ fn send_guarded(
             .send_string(&b.to_string()),
         None => req.call(),
     };
-    result.map(|_| ()).map_err(|e| short_err(e))
+    result.map(|_| ()).map_err(short_err)
 }
 
 fn short_err(e: ureq::Error) -> String {
@@ -375,9 +391,7 @@ impl App {
         expanded.insert(String::new()); // root starts open
         App {
             base,
-            agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(5))
-                .build(),
+            agent: build_agent(ureq::AgentBuilder::new().timeout(Duration::from_secs(5))),
             root: Value::Null,
             exists: false,
             version: 0,
@@ -750,16 +764,20 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
 fn main() {
     let mut base = "http://127.0.0.1:8080".to_string();
     let mut check = false;
-    for arg in std::env::args().skip(1) {
+    let mut token = std::env::var("VISIJSON_TOKEN").ok().filter(|t| !t.is_empty());
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--check" => check = true,
+            "--token" => token = args.next(),
             "--help" | "-h" => {
-                println!("usage: visijson-tui [URL] [--check]");
+                println!("usage: visijson-tui [URL] [--check] [--token TOKEN]  (or VISIJSON_TOKEN)");
                 return;
             }
             other => base = other.trim_end_matches('/').to_string(),
         }
     }
+    TOKEN.set(token).expect("token set once");
 
     let (tx, rx) = mpsc::channel();
     let last_seen = Arc::new(AtomicU64::new(0));

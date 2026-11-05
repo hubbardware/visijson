@@ -38,6 +38,8 @@ pub struct Pending {
     pub committed: Arc<Committed>,
     pub changed_paths: Arc<Vec<String>>,
     pub ops: Vec<Op>,
+    /// Who committed it (recorded in the WAL record), if known.
+    pub actor: Option<Arc<str>>,
 }
 
 pub struct Ordered {
@@ -217,6 +219,7 @@ mod tests {
             committed: committed(version),
             changed_paths: Arc::new(vec![format!("/v{version}")]),
             ops: Vec::new(),
+            actor: None,
         }
     }
 

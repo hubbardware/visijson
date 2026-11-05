@@ -20,6 +20,12 @@ pub enum StoreError {
     FormulaCycle(String),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+    /// No (valid) credential, and the operation needs one — HTTP 401.
+    #[error("authentication required: {0}")]
+    Unauthorized(String),
+    /// Authenticated, but not allowed — HTTP 403.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("write-ahead log failed, store is fail-stopped for writes: {0}")]
     WalBroken(String),
     #[error("io error: {0}")]

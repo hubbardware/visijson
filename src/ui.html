@@ -99,6 +99,20 @@
     color: var(--amber); font-size: 13px; min-width: 5ch; text-align: right;
   }
   .ver.tick { animation: pop 0.35s ease; }
+  .who { color: var(--dim); font-size: 11px; }
+
+  /* ---------------------------------------------------- sign-in */
+  dialog {
+    border: 1px solid var(--line); border-radius: 4px; padding: 18px 20px;
+    background: var(--panel); color: inherit; font: inherit;
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+  dialog form { display: flex; flex-direction: column; gap: 10px; min-width: 260px; }
+  dialog input {
+    font: inherit; padding: 6px 8px; color: inherit;
+    background: var(--panel-deep); border: 1px solid var(--line); border-radius: 3px;
+  }
+  dialog .row { display: flex; gap: 8px; justify-content: flex-end; }
 
   /* ---------------------------------------------------- layout */
   main {
@@ -242,6 +256,8 @@
       <span class="led" id="led"></span>
       <span class="label" id="conn">offline</span>
       <span class="label">v</span><span class="ver" id="ver">–</span>
+      <span class="who" id="who" hidden></span>
+      <button id="authBtn" hidden>sign in</button>
     </div>
   </header>
   <main>
@@ -271,6 +287,17 @@
   </main>
 </div>
 <div class="toast" id="toast"></div>
+<dialog id="loginDlg">
+  <form id="loginForm">
+    <span class="label">sign in</span>
+    <input id="loginUser" autocomplete="username" placeholder="username" required>
+    <input id="loginPass" type="password" autocomplete="current-password" placeholder="password" required>
+    <div class="row">
+      <button type="button" id="loginCancel">cancel</button>
+      <button type="submit">sign in</button>
+    </div>
+  </form>
+</dialog>
 
 <script>
 "use strict";
@@ -489,7 +516,7 @@ async function putValue(pointer, value) {
   try {
     const resp = await fetch(docUrl(pointer), {
       method: "PUT",
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: { "content-type": "application/json", accept: "application/json", ...WRITE_HEADERS },
       body: JSON.stringify(value),
     });
     const body = await resp.json();
@@ -542,7 +569,7 @@ $("#deleteBtn").addEventListener("click", async () => {
   try {
     const resp = await fetch(docUrl(state.pointer), {
       method: "DELETE",
-      headers: { accept: "application/json" },
+      headers: { accept: "application/json", ...WRITE_HEADERS },
     });
     const body = await resp.json();
     if (!resp.ok) toast(body.error || ("HTTP " + resp.status), true);
@@ -576,6 +603,43 @@ function logEvent(version, paths, meta) {
   log.prepend(row);
   while (log.children.length > 80) log.lastChild.remove();
 }
+
+// ------------------------------------------------ auth
+// With AUTH=on the session rides an HttpOnly cookie set by /auth/login.
+// Cookie-authenticated writes must carry this header (the server's CSRF
+// defense); it's harmless when auth is off.
+const WRITE_HEADERS = { "x-visijson-request": "1" };
+async function refreshWho() {
+  try {
+    const resp = await fetch("/auth/whoami", { headers: { accept: "application/json" } });
+    state.who = await resp.json();
+  } catch { return; }
+  const who = state.who;
+  if (!who.auth_enabled) return;
+  $("#who").hidden = false;
+  $("#authBtn").hidden = false;
+  $("#who").textContent = who.anonymous ? "anonymous" : (who.display || who.principal);
+  $("#authBtn").textContent = who.anonymous ? "sign in" : "sign out";
+}
+$("#authBtn").addEventListener("click", async () => {
+  if (state.who && !state.who.anonymous) {
+    await fetch("/auth/logout", { method: "POST", headers: WRITE_HEADERS });
+    location.reload();
+  } else {
+    $("#loginDlg").showModal();
+  }
+});
+$("#loginCancel").addEventListener("click", () => $("#loginDlg").close());
+$("#loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const resp = await fetch("/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ username: $("#loginUser").value, password: $("#loginPass").value }),
+  });
+  if (resp.ok) location.reload();
+  else toast((await resp.json()).error || "sign-in failed", true);
+});
 
 // ------------------------------------------------ status + toast
 function setConnected(on) {
@@ -635,7 +699,9 @@ function connect() {
   // the event format.
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(proto + "://" + location.host + docUrl(state.pointer), "json-patch");
+  let opened = false;
   ws.onopen = () => {
+    opened = true;
     setConnected(true);
     state.reconnectDelay = 400;
   };
@@ -660,14 +726,22 @@ function connect() {
       }
     }
   };
-  ws.onclose = () => {
+  ws.onclose = (e) => {
     setConnected(false);
+    // 1008 = the server closed us because access was revoked; a refused
+    // handshake (no read access) surfaces as 1006.
+    if (e.code === 1008) toast("access revoked", true);
+    const who = state.who;
+    if (!opened && who && who.auth_enabled && who.anonymous && !state.promptedLogin) {
+      state.promptedLogin = true;
+      $("#loginDlg").showModal();
+    }
     setTimeout(connect, state.reconnectDelay);
     state.reconnectDelay = Math.min(state.reconnectDelay * 2, 8000);
   };
   ws.onerror = () => ws.close();
 }
-connect();
+refreshWho().then(connect);
 </script>
 </body>
 </html>

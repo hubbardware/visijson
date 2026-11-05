@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod error;
 pub mod formulas;
 pub mod meta;
@@ -15,5 +16,7 @@ pub use error::{Result, StoreError};
 pub use meta::Stamp;
 pub use model::{Node, PlainView, Pointer};
 pub use persistence::Durability;
-pub use store::{CommitInfo, Committed, Condition, Op, Store, StoreConfig};
+pub use store::{
+    CommitCtx, CommitInfo, Committed, Condition, Op, Store, StoreConfig, WriteEffect, WriteGuard,
+};
 pub use typed::{to_node, Document, TypedMount};

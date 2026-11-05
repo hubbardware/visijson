@@ -24,6 +24,14 @@
 //! field; format via an Accept parameter, `text/event-stream;patch=
 //! merge-patch` — an Accept preferring text/html gets the embedded UI;
 //! everything else gets JSON.
+//!
+//! Auth (TODO #6, `auth` module): every request passes the auth middleware,
+//! which resolves its credential into a `Caller` extension — unrestricted
+//! when auth is disabled. Reads and subscriptions need `read` on the path
+//! (no holes: a grant on the path or an ancestor); writes commit through
+//! `Store::commit_with` with the caller as `WriteGuard`, so they authorize
+//! on the commit's effect; conditions need `read`. Live streams close when
+//! the caller's credential or grant goes away. `/info` stays public.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,17 +42,24 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::auth::{self, Auth, Caller, Perm};
 use crate::error::StoreError;
 use crate::meta::Stamp;
 use crate::model::{self, from_value, get_at, to_plain_value, Node, PlainView, Pointer};
 use crate::store::{Condition, Op, Store};
 use crate::subscriptions::CommitEvent;
 
+/// The API with auth disabled: every caller is unrestricted.
 pub fn router(doc: Arc<Store>, info: Arc<Store>) -> Router {
+    router_with_auth(doc, info, None)
+}
+
+/// The API, with `auth` (if any) enforcing credentials and grants.
+pub fn router_with_auth(doc: Arc<Store>, info: Arc<Store>, auth: Option<Arc<Auth>>) -> Router {
     Router::new()
         .route(
             "/doc",
@@ -72,9 +87,23 @@ pub fn router(doc: Arc<Store>, info: Arc<Store>) -> Router {
             Router::new()
                 .route("/info", get(get_root))
                 .route("/info/*path", get(get_path))
-                .with_state(info),
+                .with_state(info)
+                // Public: liveness metadata is readable by anyone. Route
+                // layers run after the auth middleware, so this overrides
+                // whatever caller it resolved.
+                .layer(Extension(Caller::unrestricted())),
         )
+        .merge(auth::http::routes(auth.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            auth::http::authenticate,
+        ))
+        .layer(Extension(AuthHandle(auth)))
 }
+
+/// The auth service (if enabled), for handlers that re-validate callers.
+#[derive(Clone)]
+struct AuthHandle(Option<Arc<Auth>>);
 
 struct ApiError(StoreError);
 
@@ -86,7 +115,15 @@ impl From<StoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self.0 {
+        error_response(self.0)
+    }
+}
+
+/// The JSON error response for a store error — shared with the auth
+/// endpoints so every error has the same shape and status mapping.
+pub(crate) fn error_response(e: StoreError) -> Response {
+    {
+        let status = match &e {
             StoreError::NotFound(_) => StatusCode::NOT_FOUND,
             StoreError::Conflict(_) | StoreError::RetryLimit(_) => StatusCode::CONFLICT,
             StoreError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
@@ -95,10 +132,17 @@ impl IntoResponse for ApiError {
             | StoreError::TypeMismatch { .. }
             | StoreError::FormulaParse { .. }
             | StoreError::Unsupported(_) => StatusCode::BAD_REQUEST,
+            StoreError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            StoreError::Forbidden(_) => StatusCode::FORBIDDEN,
             StoreError::WalBroken(_) => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::Io(_) | StoreError::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(json!({ "error": self.0.to_string() }))).into_response()
+        let body = Json(json!({ "error": e.to_string() }));
+        if status == StatusCode::UNAUTHORIZED {
+            let challenge = [(header::WWW_AUTHENTICATE, "Bearer realm=\"visijson\"")];
+            return (status, challenge, body).into_response();
+        }
+        (status, body).into_response()
     }
 }
 
@@ -137,32 +181,51 @@ fn wants_html(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Who is asking, and how to re-validate them later (for live streams).
+#[derive(Clone)]
+struct Asker {
+    caller: Caller,
+    auth: Option<Arc<Auth>>,
+}
+
 async fn get_root(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
+    Extension(AuthHandle(auth)): Extension<AuthHandle>,
     Query(q): Query<GetQuery>,
     headers: HeaderMap,
     ws: Option<WebSocketUpgrade>,
 ) -> ApiResult {
+    let asker = Asker { caller, auth };
     match ws {
-        Some(ws) => subscribe(ws, store, String::new(), &headers),
-        None => read(store, String::new(), q, headers).await,
+        Some(ws) => subscribe(ws, store, String::new(), &headers, asker),
+        None => read(store, String::new(), q, headers, asker).await,
     }
 }
 
 async fn get_path(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
+    Extension(AuthHandle(auth)): Extension<AuthHandle>,
     Path(path): Path<String>,
     Query(q): Query<GetQuery>,
     headers: HeaderMap,
     ws: Option<WebSocketUpgrade>,
 ) -> ApiResult {
+    let asker = Asker { caller, auth };
     match ws {
-        Some(ws) => subscribe(ws, store, pointer_of(&path), &headers),
-        None => read(store, pointer_of(&path), q, headers).await,
+        Some(ws) => subscribe(ws, store, pointer_of(&path), &headers, asker),
+        None => read(store, pointer_of(&path), q, headers, asker).await,
     }
 }
 
-async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -> ApiResult {
+async fn read(
+    store: Arc<Store>,
+    ptr: String,
+    q: GetQuery,
+    headers: HeaderMap,
+    asker: Asker,
+) -> ApiResult {
     // `Accept: text/event-stream` subscribes over SSE instead of reading.
     if let Some(format) = sse_request(&headers) {
         // EventSource reconnects with the last event id it saw — a commit
@@ -171,7 +234,7 @@ async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -
             .get("last-event-id")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
-        return subscribe_sse(store, ptr, format?, last_seen);
+        return subscribe_sse(store, ptr, format?, last_seen, asker);
     }
     // Browsers get the live UI for any path — even one that doesn't exist
     // yet, so you can navigate somewhere and create it. `?raw=true` stays
@@ -202,6 +265,8 @@ async fn read(store: Arc<Store>, ptr: String, q: GetQuery, headers: HeaderMap) -
         }
         return Ok((validators, Html(UI_HTML)).into_response());
     }
+    // Checked before existence, so a 404 never reveals what's unreadable.
+    asker.caller.require(Perm::Read, &Pointer::parse(&ptr)?)?;
     let Some(node) = store.get_node(&ptr)? else {
         return Err(ApiError(StoreError::NotFound(ptr)));
     };
@@ -285,35 +350,60 @@ fn write_conditions(headers: &HeaderMap, path: &str) -> Vec<Condition> {
     conds
 }
 
+/// Conditions reveal values and modification times, so each needs `read`
+/// on its path — whatever the caller may write.
+fn check_conditions_readable(caller: &Caller, conds: &[Condition]) -> Result<(), StoreError> {
+    for c in conds {
+        caller.require(Perm::Read, &Pointer::parse(&c.path)?)?;
+    }
+    Ok(())
+}
+
+/// Commit `ops` as `caller`: conditions must be readable, and the commit's
+/// effect is authorized inside the commit loop (the caller is the guard).
+async fn commit_as(
+    store: Arc<Store>,
+    caller: Caller,
+    ops: Vec<Op>,
+    conds: Vec<Condition>,
+) -> ApiResult {
+    check_conditions_readable(&caller, &conds)?;
+    Ok(Json(commit_blocking(move || store.commit_with(ops, &conds, caller.ctx())).await?)
+        .into_response())
+}
+
 /// One conditional write: `op` at `ptr`, guarded by any `If-Match` /
 /// `If-Unmodified-Since` the request carried.
 async fn write_one(
     store: Arc<Store>,
+    caller: Caller,
     headers: &HeaderMap,
     ptr: &str,
     op: impl FnOnce(String) -> Op,
 ) -> ApiResult {
     let conds = write_conditions(headers, ptr);
     let ops = vec![op(ptr.to_string())];
-    Ok(Json(commit_blocking(move || store.commit(ops, &conds)).await?).into_response())
+    commit_as(store, caller, ops, conds).await
 }
 
 async fn put_root(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> ApiResult {
-    put_reconciling(store, &headers, String::new(), body).await
+    put_reconciling(store, caller, &headers, String::new(), body).await
 }
 
 async fn put_path(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     Path(path): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> ApiResult {
     let ptr = pointer_of(&path);
-    put_reconciling(store, &headers, ptr, body).await
+    put_reconciling(store, caller, &headers, ptr, body).await
 }
 
 /// PUT parses the body against the current subtree at the target path
@@ -324,17 +414,21 @@ async fn put_path(
 /// just means less sharing, never a wrong result.
 async fn put_reconciling(
     store: Arc<Store>,
+    caller: Caller,
     headers: &HeaderMap,
     ptr: String,
     body: axum::body::Bytes,
 ) -> ApiResult {
     let conds = write_conditions(headers, &ptr);
+    check_conditions_readable(&caller, &conds)?;
     Ok(Json(
         commit_blocking(move || {
+            // The hint only shapes parsing (structural sharing); nothing
+            // about it reaches the caller, so it needs no permission.
             let hint = store.get_node(&ptr)?;
             let value = model::node_from_slice_reconciling(&body, hint.as_ref())
                 .map_err(|e| StoreError::Unsupported(format!("invalid JSON body: {e}")))?;
-            store.commit(vec![Op::Put { path: ptr, value }], &conds)
+            store.commit_with(vec![Op::Put { path: ptr, value }], &conds, caller.ctx())
         })
         .await?,
     )
@@ -345,21 +439,23 @@ async fn put_reconciling(
 
 async fn post_root(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     headers: HeaderMap,
     Json(node): Json<Node>,
 ) -> ApiResult {
     let value = Arc::new(node);
-    write_one(store, &headers, "", |path| Op::Append { path, value }).await
+    write_one(store, caller, &headers, "", |path| Op::Append { path, value }).await
 }
 
 async fn post_path(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     Path(path): Path<String>,
     headers: HeaderMap,
     Json(node): Json<Node>,
 ) -> ApiResult {
     let value = Arc::new(node);
-    write_one(store, &headers, &pointer_of(&path), |path| Op::Append {
+    write_one(store, caller, &headers, &pointer_of(&path), |path| Op::Append {
         path,
         value,
     })
@@ -368,16 +464,21 @@ async fn post_path(
 
 // ------------------------------------------------------------------ DELETE
 
-async fn delete_root(State(store): State<Arc<Store>>, headers: HeaderMap) -> ApiResult {
-    write_one(store, &headers, "", |path| Op::Remove { path }).await
+async fn delete_root(
+    State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+) -> ApiResult {
+    write_one(store, caller, &headers, "", |path| Op::Remove { path }).await
 }
 
 async fn delete_path(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult {
-    write_one(store, &headers, &pointer_of(&path), |path| Op::Remove {
+    write_one(store, caller, &headers, &pointer_of(&path), |path| Op::Remove {
         path,
     })
     .await
@@ -430,19 +531,21 @@ fn patch_to_ops(prefix: &str, patch: Vec<PatchOp>) -> Result<(Vec<Op>, Vec<Condi
 
 async fn patch_root(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    apply_patch(store, String::new(), headers, body).await
+    apply_patch(store, caller, String::new(), headers, body).await
 }
 
 async fn patch_path(
     State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
     Path(path): Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    apply_patch(store, pointer_of(&path), headers, body).await
+    apply_patch(store, caller, pointer_of(&path), headers, body).await
 }
 
 /// PATCH speaks both standards. `application/json-patch+json` (RFC 6902) and
@@ -451,6 +554,7 @@ async fn patch_path(
 /// a merge patch.
 async fn apply_patch(
     store: Arc<Store>,
+    caller: Caller,
     prefix: String,
     headers: HeaderMap,
     body: Value,
@@ -465,14 +569,14 @@ async fn apply_patch(
         let patch: Vec<PatchOp> = serde_json::from_value(body).map_err(StoreError::Serde)?;
         let (ops, mut conditions) = patch_to_ops(&prefix, patch)?;
         conditions.extend(write_conditions(&headers, &prefix));
-        Ok(Json(commit_blocking(move || store.commit(ops, &conditions)).await?).into_response())
+        commit_as(store, caller, ops, conditions).await
     } else {
         let conditions = write_conditions(&headers, &prefix);
         let ops = vec![Op::Merge {
             path: prefix,
             value: from_value(&body),
         }];
-        Ok(Json(commit_blocking(move || store.commit(ops, &conditions)).await?).into_response())
+        commit_as(store, caller, ops, conditions).await
     }
 }
 
@@ -486,23 +590,28 @@ struct TxnRequest {
     conditions: Vec<Condition>,
 }
 
-async fn txn_handler(State(store): State<Arc<Store>>, Json(req): Json<TxnRequest>) -> ApiResult {
-    Ok(
-        Json(commit_blocking(move || store.commit(req.ops, &req.conditions)).await?)
-            .into_response(),
-    )
+async fn txn_handler(
+    State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
+    Json(req): Json<TxnRequest>,
+) -> ApiResult {
+    commit_as(store, caller, req.ops, req.conditions).await
 }
 
 // ------------------------------------------------------------------ /formulas
 
 /// Discovery: every formula in the document, path + expression, straight
 /// off the formula index carried in the committed head — no tree scan.
-/// Sorted by path.
-async fn formulas_handler(State(store): State<Arc<Store>>) -> ApiResult {
+/// Sorted by path; only formulas the caller can read are listed.
+async fn formulas_handler(
+    State(store): State<Arc<Store>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult {
     let head = store.head();
     let formulas: Vec<Value> = head
         .formulas
         .iter()
+        .filter(|(path, _)| caller.allows(Perm::Read, path))
         .map(|(path, info)| json!({ "path": path.to_string(), "expr": info.expr }))
         .collect();
     Ok(Json(json!({ "version": head.version, "formulas": formulas })).into_response())
@@ -687,8 +796,15 @@ const WS_PROTOCOLS: [&str; 2] = ["json-patch", "merge-patch"];
 /// format is the first recognized subprotocol the client offered (echoed back
 /// in the handshake); offering none means json-patch, offering only unknown
 /// ones is a 400.
-fn subscribe(ws: WebSocketUpgrade, store: Arc<Store>, path: String, headers: &HeaderMap) -> ApiResult {
+fn subscribe(
+    ws: WebSocketUpgrade,
+    store: Arc<Store>,
+    path: String,
+    headers: &HeaderMap,
+    asker: Asker,
+) -> ApiResult {
     let ptr = Pointer::parse(&path)?;
+    asker.caller.require(Perm::Read, &ptr)?;
     let offered: Vec<&str> = headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
@@ -707,7 +823,38 @@ fn subscribe(ws: WebSocketUpgrade, store: Arc<Store>, path: String, headers: &He
     };
     Ok(ws
         .protocols(WS_PROTOCOLS)
-        .on_upgrade(move |socket| handle_ws(socket, store, ptr, format)))
+        .on_upgrade(move |socket| handle_ws(socket, store, ptr, format, asker)))
+}
+
+/// Resolves when `asker` loses read access to `ptr`: its credential is
+/// revoked or expires, its account is disabled, or the grant goes away.
+/// Re-validates on every sys-store commit (admin-rate) and at expiry;
+/// never resolves with auth disabled or for unrestricted callers.
+async fn access_revoked(asker: Asker, ptr: Pointer) {
+    let (Some(auth), false) = (asker.auth, asker.caller.is_unrestricted()) else {
+        return std::future::pending().await;
+    };
+    let (_, mut rx) = auth.sys().subscribe();
+    let mut caller = asker.caller;
+    loop {
+        // Re-check first: closes the window between the request's own
+        // authentication and this subscription.
+        match auth.revalidate(&caller) {
+            Some(c) if c.allows(Perm::Read, &ptr) => caller = c,
+            _ => return,
+        }
+        let until_expiry = caller.expires_ms().map(|e| {
+            Duration::from_millis(e.saturating_sub(crate::store::now_ms()))
+        });
+        tokio::select! {
+            ev = rx.recv() => {
+                if let Err(tokio::sync::broadcast::error::RecvError::Closed) = ev {
+                    return std::future::pending().await;
+                }
+            }
+            _ = tokio::time::sleep(until_expiry.unwrap_or_default()), if until_expiry.is_some() => {}
+        }
+    }
 }
 
 /// The snapshot message opening (or resyncing) any subscription transport.
@@ -795,7 +942,15 @@ fn merge_patch_event(sub: &Pointer, old_root: &Arc<crate::model::Node>, ev: &Com
     Some(json!({"type": "change", "version": ev.version, "merge": merge}))
 }
 
-async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer, format: PatchFormat) {
+async fn handle_ws(
+    mut socket: WebSocket,
+    store: Arc<Store>,
+    ptr: Pointer,
+    format: PatchFormat,
+    asker: Asker,
+) {
+    let revoked = access_revoked(asker, ptr.clone());
+    tokio::pin!(revoked);
     let (snapshot, mut rx) = store.subscribe();
     let mut last_root = snapshot.root.clone();
     let hello = snapshot_msg(snapshot.version, &snapshot.root, &ptr, false);
@@ -831,6 +986,14 @@ async fn handle_ws(mut socket: WebSocket, store: Arc<Store>, ptr: Pointer, forma
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
                 Some(Ok(_)) => {} // ignore pings/client chatter
             },
+            _ = &mut revoked => {
+                let frame = axum::extract::ws::CloseFrame {
+                    code: axum::extract::ws::close_code::POLICY,
+                    reason: "access revoked".into(),
+                };
+                let _ = socket.send(Message::Close(Some(frame))).await;
+                return;
+            }
         }
     }
 }
@@ -887,8 +1050,12 @@ fn subscribe_sse(
     path: String,
     format: PatchFormat,
     last_seen: Option<u64>,
+    asker: Asker,
 ) -> ApiResult {
     let ptr = Pointer::parse(&path)?;
+    asker.caller.require(Perm::Read, &ptr)?;
+    let revoked: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(access_revoked(asker, ptr.clone()));
     let (snapshot, rx) = store.subscribe();
     let still_current = last_seen.is_some_and(|v| {
         v <= snapshot.version && snapshot.mods.last_modified(&ptr).version <= v
@@ -909,6 +1076,7 @@ fn subscribe_sse(
         format: PatchFormat,
         rx: tokio::sync::broadcast::Receiver<Arc<CommitEvent>>,
         last_root: Arc<Node>,
+        revoked: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     }
     let ctx = Ctx {
         store,
@@ -916,13 +1084,20 @@ fn subscribe_sse(
         format,
         rx,
         last_root: snapshot.root.clone(),
+        revoked,
     };
     let stream = futures_util::stream::unfold((ctx, first), |(mut ctx, queued)| async move {
         if let Some(ev) = queued {
             return Some((Ok::<_, std::convert::Infallible>(ev), (ctx, None)));
         }
         loop {
-            match ctx.rx.recv().await {
+            // Losing access ends the stream; the client's reconnect then
+            // gets the honest 401/403.
+            let event = tokio::select! {
+                ev = ctx.rx.recv() => ev,
+                _ = &mut ctx.revoked => return None,
+            };
+            match event {
                 Ok(ev) => {
                     let msg = change_msg(ctx.format, &ctx.ptr, &ctx.last_root, &ev);
                     ctx.last_root = ev.committed.root.clone();
