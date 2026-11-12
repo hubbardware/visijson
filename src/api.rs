@@ -40,7 +40,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
@@ -61,6 +61,7 @@ pub fn router(doc: Arc<Store>, info: Arc<Store>) -> Router {
 /// The API, with `auth` (if any) enforcing credentials and grants.
 pub fn router_with_auth(doc: Arc<Store>, info: Arc<Store>, auth: Option<Arc<Auth>>) -> Router {
     Router::new()
+        .route("/", get(root_redirect))
         .route(
             "/doc",
             get(get_root)
@@ -179,6 +180,16 @@ fn wants_html(headers: &HeaderMap) -> bool {
             _ => false,
         })
         .unwrap_or(false)
+}
+
+/// A browser landing on the bare origin goes to the UI; API clients keep the
+/// plain 404 (there's no document at `/`).
+async fn root_redirect(headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        Redirect::temporary("/doc").into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
 }
 
 /// Who is asking, and how to re-validate them later (for live streams).

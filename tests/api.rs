@@ -219,6 +219,27 @@ async fn browsers_get_the_embedded_ui_api_clients_get_json() {
         assert!(body.contains("visijson"), "UI page not served for {path}");
     }
 
+    // The bare origin sends browsers to the UI; API clients get a 404.
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = no_redirect
+        .get(format!("{base}/"))
+        .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 307);
+    assert_eq!(resp.headers()["location"], "/doc");
+    let resp = no_redirect
+        .get(format!("{base}/"))
+        .header("accept", "*/*")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
     // JSON Accept (and curl's */*) still get data + real 404s.
     let v: Value = client
         .get(format!("{base}/doc/a"))
