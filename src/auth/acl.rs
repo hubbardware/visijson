@@ -142,7 +142,10 @@ impl Acl {
             // Invalid records can't enter through the API; skip rather than
             // fail every request if one ever appears.
             match (Pointer::parse(&g.path), PermSet::parse(&g.perms)) {
-                (Ok(p), Ok(ps)) => by_subject.entry(g.subject.clone()).or_default().push((p, ps)),
+                (Ok(p), Ok(ps)) => by_subject
+                    .entry(g.subject.clone())
+                    .or_default()
+                    .push((p, ps)),
                 _ => tracing::warn!(grant = %id, "skipping malformed grant"),
             }
         }
@@ -155,10 +158,9 @@ impl Acl {
 
     pub fn allows(&self, subjects: &[String], perm: Perm, ptr: &Pointer) -> bool {
         subjects.iter().any(|s| {
-            self.by_subject.get(s).is_some_and(|gs| {
-                gs.iter()
-                    .any(|(p, ps)| ps.has(perm) && p.is_prefix_of(ptr))
-            })
+            self.by_subject
+                .get(s)
+                .is_some_and(|gs| gs.iter().any(|(p, ps)| ps.has(perm) && p.is_prefix_of(ptr)))
         })
     }
 
@@ -167,7 +169,9 @@ impl Acl {
         &'a self,
         subjects: &'a [String],
     ) -> impl Iterator<Item = &'a (String, GrantRec)> + 'a {
-        self.grants.iter().filter(|(_, g)| subjects.contains(&g.subject))
+        self.grants
+            .iter()
+            .filter(|(_, g)| subjects.contains(&g.subject))
     }
 }
 
@@ -178,8 +182,13 @@ pub enum Source {
     Unrestricted,
     Anonymous,
     /// A session, by the sha256 of its token.
-    Session { id: String },
-    ApiKey { principal: String, credential: String },
+    Session {
+        id: String,
+    },
+    ApiKey {
+        principal: String,
+        credential: String,
+    },
 }
 
 /// The authenticated party behind one request (or one live stream). Cheap
@@ -259,9 +268,11 @@ impl Caller {
         }
         let granted = self.0.acl.allows(&self.0.subjects, perm, ptr);
         granted
-            && self.0.scope.as_ref().is_none_or(|s| {
-                s.iter().any(|(p, ps)| ps.has(perm) && p.is_prefix_of(ptr))
-            })
+            && self
+                .0
+                .scope
+                .as_ref()
+                .is_none_or(|s| s.iter().any(|(p, ps)| ps.has(perm) && p.is_prefix_of(ptr)))
     }
 
     /// The error for a denied check: 401 for the anonymous caller (log in
@@ -278,7 +289,11 @@ impl Caller {
         if self.allows(perm, ptr) {
             Ok(())
         } else {
-            let at = if ptr.is_root() { "/".to_string() } else { ptr.to_string() };
+            let at = if ptr.is_root() {
+                "/".to_string()
+            } else {
+                ptr.to_string()
+            };
             Err(self.deny(format!("{} access to {at} denied", perm.name())))
         }
     }
@@ -397,7 +412,10 @@ mod tests {
         assert!(c.allows(Perm::Write, &ptr("/teamA/score")));
         assert!(c.allows(Perm::Read, &ptr("/teamA")));
         assert!(!c.allows(Perm::Read, &ptr("/teamB")));
-        assert!(!c.allows(Perm::Read, &ptr("")), "a subtree grant never covers its ancestors");
+        assert!(
+            !c.allows(Perm::Read, &ptr("")),
+            "a subtree grant never covers its ancestors"
+        );
         assert!(!c.allows(Perm::Formula, &ptr("/teamA/x")));
         assert!(c.allows(Perm::Formula, &ptr("/ops/deep/x")));
         // Prefix is per token, not per character.
@@ -407,11 +425,20 @@ mod tests {
     #[test]
     fn scope_narrows_never_widens() {
         let a = acl(&[("principal:p_1", "", &["read", "write"])]);
-        let scope = Arc::new(vec![(ptr("/public"), PermSet::parse(&["read".into(), "admin".into()]).unwrap())]);
+        let scope = Arc::new(vec![(
+            ptr("/public"),
+            PermSet::parse(&["read".into(), "admin".into()]).unwrap(),
+        )]);
         let c = caller(a, &["principal:p_1"], Some(scope));
         assert!(c.allows(Perm::Read, &ptr("/public/x")));
-        assert!(c.allows(Perm::Write, &ptr("/public/x")), "admin in scope admits write the grant has");
-        assert!(!c.allows(Perm::Admin, &ptr("/public")), "scope can't add what grants lack");
+        assert!(
+            c.allows(Perm::Write, &ptr("/public/x")),
+            "admin in scope admits write the grant has"
+        );
+        assert!(
+            !c.allows(Perm::Admin, &ptr("/public")),
+            "scope can't add what grants lack"
+        );
         assert!(!c.allows(Perm::Read, &ptr("/private")));
     }
 

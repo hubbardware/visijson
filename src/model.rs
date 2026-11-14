@@ -63,7 +63,9 @@ pub fn from_value(v: &Value) -> Arc<Node> {
                 }));
             }
             Arc::new(Node::Object(
-                map.iter().map(|(k, v)| (k.clone(), from_value(v))).collect(),
+                map.iter()
+                    .map(|(k, v)| (k.clone(), from_value(v)))
+                    .collect(),
             ))
         }
     }
@@ -976,20 +978,29 @@ mod tests {
     #[test]
     fn reconciling_parse_of_identical_body_returns_the_hint_root() {
         let old = from_value(&json!({"a": {"b": [1, 2]}, "s": "x", "n": null}));
-        let new = parse(&json!({"a": {"b": [1, 2]}, "s": "x", "n": null}), Some(&old));
+        let new = parse(
+            &json!({"a": {"b": [1, 2]}, "s": "x", "n": null}),
+            Some(&old),
+        );
         assert!(Arc::ptr_eq(&old, &new));
     }
 
     #[test]
     fn reconciling_parse_shares_untouched_siblings() {
         let old = from_value(&json!({"keep": {"big": [1, 2, 3]}, "change": 1}));
-        let new = parse(&json!({"keep": {"big": [1, 2, 3]}, "change": 2}), Some(&old));
+        let new = parse(
+            &json!({"keep": {"big": [1, 2, 3]}, "change": 2}),
+            Some(&old),
+        );
         assert!(!Arc::ptr_eq(&old, &new));
         let (Node::Object(o), Node::Object(n)) = (&*old, &*new) else {
             panic!()
         };
         assert!(Arc::ptr_eq(o.get("keep").unwrap(), n.get("keep").unwrap()));
-        assert!(!Arc::ptr_eq(o.get("change").unwrap(), n.get("change").unwrap()));
+        assert!(!Arc::ptr_eq(
+            o.get("change").unwrap(),
+            n.get("change").unwrap()
+        ));
     }
 
     #[test]
@@ -1011,10 +1022,16 @@ mod tests {
     fn reconciling_parse_preserves_formula_shapes() {
         let old = from_value(&json!({"f": {"$formula": "/a + 1", "$value": 2}, "a": 1}));
         // Identical formula reuses the whole node.
-        let new = parse(&json!({"f": {"$formula": "/a + 1", "$value": 2}, "a": 1}), Some(&old));
+        let new = parse(
+            &json!({"f": {"$formula": "/a + 1", "$value": 2}, "a": 1}),
+            Some(&old),
+        );
         assert!(Arc::ptr_eq(&old, &new));
         // A changed expression yields a fresh formula node.
-        let new = parse(&json!({"f": {"$formula": "/a + 2", "$value": 2}, "a": 1}), Some(&old));
+        let new = parse(
+            &json!({"f": {"$formula": "/a + 2", "$value": 2}, "a": 1}),
+            Some(&old),
+        );
         let Node::Object(n) = &*new else { panic!() };
         assert!(matches!(&**n.get("f").unwrap(), Node::Formula(f) if f.expr == "/a + 2"));
         // A formula without hint still parses as a formula.

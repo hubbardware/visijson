@@ -396,7 +396,9 @@ fn eval_jq(program: &str, input: Value) -> std::result::Result<Value, String> {
         Some(Ok(v)) => v,
     };
     if out.next().is_some() {
-        return Err("jq produced multiple values; wrap the program in [...] to collect them".into());
+        return Err(
+            "jq produced multiple values; wrap the program in [...] to collect them".into(),
+        );
     }
     Ok(first.into())
 }
@@ -540,7 +542,10 @@ impl FormulaIndex {
         }
         for sr in scan_roots {
             overlapping(&self.formulas, sr, |k, info| {
-                let unchanged = prev.formulas.get(k).is_some_and(|old| Arc::ptr_eq(old, info));
+                let unchanged = prev
+                    .formulas
+                    .get(k)
+                    .is_some_and(|old| Arc::ptr_eq(old, info));
                 if sr.is_prefix_of(k) && !unchanged && !out.iter().any(|(p, _)| p == k) {
                     out.push((k.clone(), info.clone()));
                 }

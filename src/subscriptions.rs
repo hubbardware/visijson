@@ -251,7 +251,10 @@ mod tests {
         let err = hub.finalize(pending(1), |_, _| Err(io_err())).unwrap_err();
         assert!(matches!(err, StoreError::Io(_)), "got {err:?}");
         // Every later commit fails fast, before and inside finalize.
-        assert!(matches!(hub.check_writable(), Err(StoreError::WalBroken(_))));
+        assert!(matches!(
+            hub.check_writable(),
+            Err(StoreError::WalBroken(_))
+        ));
         let err = hub.finalize(pending(2), |_, _| Ok(())).unwrap_err();
         assert!(matches!(err, StoreError::WalBroken(_)), "got {err:?}");
         // Nothing was published for the failed commit.

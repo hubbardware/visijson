@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use serde_json::{json, Map, Value};
 use visijson::store::Store;
 use visijson::typed::{Document, TypedMount};
-use serde_json::{json, Map, Value};
 
 #[derive(Document, Clone, serde::Serialize)]
 struct BPlayer {
@@ -35,7 +35,10 @@ fn main() {
     let store = Store::in_memory();
     let t = Instant::now();
     store.put("/players", players.clone()).unwrap();
-    println!("initial PUT of {PLAYERS} x {FIELDS}:      {:?}", t.elapsed());
+    println!(
+        "initial PUT of {PLAYERS} x {FIELDS}:      {:?}",
+        t.elapsed()
+    );
 
     // Worst case for the diff: replace the whole subtree with a freshly
     // parsed tree (zero structural sharing, so ptr_eq never short-circuits)
@@ -76,7 +79,9 @@ fn main() {
     let plain: visijson::Node = serde_json::from_slice(&body1).unwrap();
     let parse_plain = t.elapsed();
     let t = Instant::now();
-    store.put_node("/players", std::sync::Arc::new(plain)).unwrap();
+    store
+        .put_node("/players", std::sync::Arc::new(plain))
+        .unwrap();
     let commit_plain = t.elapsed();
 
     let mut d2 = players.clone();
@@ -89,7 +94,9 @@ fn main() {
     let t = Instant::now();
     store.put_node("/players", node).unwrap();
     let commit_rec = t.elapsed();
-    println!("REST full-replace, plain parse:      {parse_plain:?} parse + {commit_plain:?} commit");
+    println!(
+        "REST full-replace, plain parse:      {parse_plain:?} parse + {commit_plain:?} commit"
+    );
     println!("REST full-replace, reconciling:      {parse_rec:?} parse + {commit_rec:?} commit");
 
     // Where does single-field commit time go? Time the formula sweep alone.
@@ -105,7 +112,11 @@ fn main() {
     // The one-time cost the index replaces: a full-tree formula scan.
     let t = Instant::now();
     let index = visijson::formulas::scan_index(&head.root);
-    println!("full scan_index (open/recovery only): {:?} ({} formulas)", t.elapsed(), index.len());
+    println!(
+        "full scan_index (open/recovery only): {:?} ({} formulas)",
+        t.elapsed(),
+        index.len()
+    );
 
     // Spreadsheet-shaped: many formulas alongside the data. Commit cost must
     // scale with the formulas a change touches, not with all of them.
@@ -119,7 +130,10 @@ fn main() {
     }
     let t = Instant::now();
     store.put("/calc", Value::Object(calc)).unwrap();
-    println!("PUT creating {FORMULAS} formulas:         {:?}", t.elapsed());
+    println!(
+        "PUT creating {FORMULAS} formulas:         {:?}",
+        t.elapsed()
+    );
 
     let t = Instant::now();
     store.put("/players/u00042/field_007", json!(7)).unwrap();
@@ -136,7 +150,10 @@ fn main() {
             .collect();
     let t = Instant::now();
     visijson::formulas::reevaluate(&head.root, &changed, &head.formulas).unwrap();
-    println!("reevaluate, {FORMULAS} formulas 0 dirty:  {:?}", t.elapsed());
+    println!(
+        "reevaluate, {FORMULAS} formulas 0 dirty:  {:?}",
+        t.elapsed()
+    );
 
     // Typed fast lane: native struct diffing via #[derive(Document)].
     // Clones happen before the timers — a real poller hands over freshly

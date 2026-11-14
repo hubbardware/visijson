@@ -28,8 +28,8 @@ use arc_swap::ArcSwap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub use acl::{Acl, Caller, GrantRec, Perm, PermSet, Scope, ScopeEntry, Source};
 use acl::CallerInner;
+pub use acl::{Acl, Caller, GrantRec, Perm, PermSet, Scope, ScopeEntry, Source};
 
 use crate::error::{Result, StoreError};
 use crate::model::{from_value, Pointer};
@@ -103,8 +103,13 @@ struct SessionRec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SourceRec {
-    Session { id: String },
-    ApiKey { principal: String, credential: String },
+    Session {
+        id: String,
+    },
+    ApiKey {
+        principal: String,
+        credential: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,14 +212,18 @@ fn put_op<T: Serialize>(path: String, v: &T) -> Result<Op> {
 fn normalize_username(u: &str) -> Result<String> {
     let u = u.trim().to_lowercase();
     if u.is_empty() || u.len() > 128 {
-        return Err(StoreError::Unsupported("username must be 1–128 characters".into()));
+        return Err(StoreError::Unsupported(
+            "username must be 1–128 characters".into(),
+        ));
     }
     Ok(u)
 }
 
 fn check_password_policy(pw: &str) -> Result<()> {
     if pw.chars().count() < 8 {
-        return Err(StoreError::Unsupported("password must be at least 8 characters".into()));
+        return Err(StoreError::Unsupported(
+            "password must be at least 8 characters".into(),
+        ));
     }
     Ok(())
 }
@@ -311,7 +320,9 @@ impl Auth {
     /// Resolve a bearer/cookie token (`vjs_…` session or `vjk_…` API key).
     pub fn authenticate(&self, token: &str, via_cookie: bool) -> Result<Caller> {
         let source = if token.starts_with("vjs_") {
-            Source::Session { id: sha256_hex(token) }
+            Source::Session {
+                id: sha256_hex(token),
+            }
         } else if let Some(rest) = token.strip_prefix("vjk_") {
             let (key_id, secret) = rest.split_once('_').ok_or_else(bad_credentials)?;
             let lookup: LookupRec = self
@@ -344,7 +355,9 @@ impl Auth {
             Source::Unrestricted => return Ok(Caller::unrestricted()),
             Source::Anonymous => return Ok(self.anonymous()),
             Source::Session { id } => {
-                let s: SessionRec = self.get(&sp(&["sessions", id]))?.ok_or_else(bad_credentials)?;
+                let s: SessionRec = self
+                    .get(&sp(&["sessions", id]))?
+                    .ok_or_else(bad_credentials)?;
                 if s.expires_ms <= now {
                     return Err(bad_credentials());
                 }
@@ -358,11 +371,17 @@ impl Auth {
                 }
                 (s.principal, None, Some(s.expires_ms))
             }
-            Source::ApiKey { principal, credential } => {
+            Source::ApiKey {
+                principal,
+                credential,
+            } => {
                 let cred: CredentialRec = self
                     .get(&sp(&["credentials", principal, credential]))?
                     .ok_or_else(bad_credentials)?;
-                let CredentialRec::ApiKey { scope, expires_ms, .. } = cred else {
+                let CredentialRec::ApiKey {
+                    scope, expires_ms, ..
+                } = cred
+                else {
                     return Err(bad_credentials());
                 };
                 if expires_ms.is_some_and(|e| e <= now) {
@@ -411,7 +430,9 @@ impl Auth {
         let username = normalize_username(username).map_err(|_| bad_credentials())?;
         let lookup: Option<LookupRec> = self.get(&sp(&["lookup", "password", &username]))?;
         let cred = match &lookup {
-            Some(l) => self.get::<CredentialRec>(&sp(&["credentials", &l.principal, &l.credential]))?,
+            Some(l) => {
+                self.get::<CredentialRec>(&sp(&["credentials", &l.principal, &l.credential]))?
+            }
             None => None,
         };
         let hash = match &cred {
@@ -420,7 +441,9 @@ impl Auth {
         };
         let ok = verify_password(password, hash);
         let (Some(lookup), true) = (lookup, ok && cred.is_some()) else {
-            return Err(StoreError::Unauthorized("invalid username or password".into()));
+            return Err(StoreError::Unauthorized(
+                "invalid username or password".into(),
+            ));
         };
         let token = format!("vjs_{}", random_hex::<32>());
         let id = sha256_hex(&token);
@@ -431,7 +454,8 @@ impl Auth {
             created_ms: now,
             expires_ms: now + self.cfg.session_ttl_ms,
         };
-        self.sys.commit(vec![put_op(sp(&["sessions", &id]), &rec)?], &[])?;
+        self.sys
+            .commit(vec![put_op(sp(&["sessions", &id]), &rec)?], &[])?;
         let caller = self.resolve(&Source::Session { id }, false)?;
         Ok((token, caller))
     }
@@ -451,7 +475,10 @@ impl Auth {
     pub fn mint_ticket(&self, caller: &Caller) -> Result<(String, u64)> {
         let source = match caller.source() {
             Source::Session { id } => SourceRec::Session { id: id.clone() },
-            Source::ApiKey { principal, credential } => SourceRec::ApiKey {
+            Source::ApiKey {
+                principal,
+                credential,
+            } => SourceRec::ApiKey {
                 principal: principal.clone(),
                 credential: credential.clone(),
             },
@@ -460,8 +487,10 @@ impl Auth {
         let ticket = format!("vjt_{}", random_hex::<32>());
         let expires_ms = now_ms() + self.cfg.ticket_ttl_ms;
         let rec = TicketRec { source, expires_ms };
-        self.sys
-            .commit(vec![put_op(sp(&["tickets", &sha256_hex(&ticket)]), &rec)?], &[])?;
+        self.sys.commit(
+            vec![put_op(sp(&["tickets", &sha256_hex(&ticket)]), &rec)?],
+            &[],
+        )?;
         Ok((ticket, expires_ms))
     }
 
@@ -482,7 +511,13 @@ impl Auth {
         }
         let source = match rec.source {
             SourceRec::Session { id } => Source::Session { id },
-            SourceRec::ApiKey { principal, credential } => Source::ApiKey { principal, credential },
+            SourceRec::ApiKey {
+                principal,
+                credential,
+            } => Source::ApiKey {
+                principal,
+                credential,
+            },
         };
         self.resolve(&source, false)
     }
@@ -494,12 +529,16 @@ impl Auth {
         let mut ops = Vec::new();
         for (id, s) in self.children::<SessionRec>("/sessions")? {
             if s.expires_ms <= now {
-                ops.push(Op::Remove { path: sp(&["sessions", &id]) });
+                ops.push(Op::Remove {
+                    path: sp(&["sessions", &id]),
+                });
             }
         }
         for (id, t) in self.children::<TicketRec>("/tickets")? {
             if t.expires_ms <= now {
-                ops.push(Op::Remove { path: sp(&["tickets", &id]) });
+                ops.push(Op::Remove {
+                    path: sp(&["tickets", &id]),
+                });
             }
         }
         let n = ops.len();
@@ -519,7 +558,9 @@ impl Auth {
         password: Option<(&str, &str)>,
     ) -> Result<String> {
         if kind != "human" && kind != "service" {
-            return Err(StoreError::Unsupported("kind must be `human` or `service`".into()));
+            return Err(StoreError::Unsupported(
+                "kind must be `human` or `service`".into(),
+            ));
         }
         let pid = format!("p_{}", random_hex::<8>());
         let rec = PrincipalRec {
@@ -570,7 +611,9 @@ impl Auth {
         }
         if let Some(s) = status {
             if s != "active" && s != "disabled" {
-                return Err(StoreError::Unsupported("status must be `active` or `disabled`".into()));
+                return Err(StoreError::Unsupported(
+                    "status must be `active` or `disabled`".into(),
+                ));
             }
             rec.status = s;
         }
@@ -590,24 +633,32 @@ impl Auth {
         if self.principal(pid)?.is_none() {
             return Err(StoreError::NotFound(pid.into()));
         }
-        let mut ops = vec![
-            Op::Remove { path: sp(&["principals", pid]) },
-        ];
+        let mut ops = vec![Op::Remove {
+            path: sp(&["principals", pid]),
+        }];
         for (_, cred) in self.children::<CredentialRec>(&sp(&["credentials", pid]))? {
-            ops.push(Op::Remove { path: lookup_path(&cred) });
+            ops.push(Op::Remove {
+                path: lookup_path(&cred),
+            });
         }
         if self.sys.get_node(&sp(&["credentials", pid]))?.is_some() {
-            ops.push(Op::Remove { path: sp(&["credentials", pid]) });
+            ops.push(Op::Remove {
+                path: sp(&["credentials", pid]),
+            });
         }
         for (id, s) in self.children::<SessionRec>("/sessions")? {
             if s.principal == pid {
-                ops.push(Op::Remove { path: sp(&["sessions", &id]) });
+                ops.push(Op::Remove {
+                    path: sp(&["sessions", &id]),
+                });
             }
         }
         let subject = format!("principal:{pid}");
         for (id, g) in self.children::<GrantRec>("/grants")? {
             if g.subject == subject {
-                ops.push(Op::Remove { path: sp(&["grants", &id]) });
+                ops.push(Op::Remove {
+                    path: sp(&["grants", &id]),
+                });
             }
         }
         self.sys.commit(ops, &[])?;
@@ -618,7 +669,12 @@ impl Auth {
 
     /// Ops (and uniqueness conditions) that set `pid`'s password credential,
     /// replacing any existing one (and its username lookup).
-    fn password_ops(&self, pid: &str, username: &str, password: &str) -> Result<(Vec<Op>, Vec<Condition>)> {
+    fn password_ops(
+        &self,
+        pid: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(Vec<Op>, Vec<Condition>)> {
         let username = normalize_username(username)?;
         check_password_policy(password)?;
         let mut ops = Vec::new();
@@ -630,7 +686,9 @@ impl Auth {
                 cid = id; // keep the id: sessions opened by it survive a change
                 same_username = *old == username;
                 if !same_username {
-                    ops.push(Op::Remove { path: lookup_path(&cred) });
+                    ops.push(Op::Remove {
+                        path: lookup_path(&cred),
+                    });
                 }
             }
         }
@@ -681,7 +739,9 @@ impl Auth {
             return Err(StoreError::NotFound("no password credential".into()));
         };
         if !verify_password(current, &hash) {
-            return Err(StoreError::Forbidden("current password is incorrect".into()));
+            return Err(StoreError::Forbidden(
+                "current password is incorrect".into(),
+            ));
         }
         self.set_password(pid, &username, new)
     }
@@ -733,10 +793,21 @@ impl Auth {
             .children::<CredentialRec>(&sp(&["credentials", pid]))?
             .into_iter()
             .map(|(id, c)| match c {
-                CredentialRec::Password { username, created_ms, .. } => json!({
+                CredentialRec::Password {
+                    username,
+                    created_ms,
+                    ..
+                } => json!({
                     "id": id, "kind": "password", "username": username, "created_ms": created_ms,
                 }),
-                CredentialRec::ApiKey { key_id, name, scope, expires_ms, created_ms, .. } => json!({
+                CredentialRec::ApiKey {
+                    key_id,
+                    name,
+                    scope,
+                    expires_ms,
+                    created_ms,
+                    ..
+                } => json!({
                     "id": id, "kind": "api_key", "key_id": key_id, "name": name,
                     "scope": scope, "expires_ms": expires_ms, "created_ms": created_ms,
                 }),
@@ -749,9 +820,16 @@ impl Auth {
     /// re-validation.
     pub fn delete_credential(&self, pid: &str, cid: &str) -> Result<()> {
         let path = sp(&["credentials", pid, cid]);
-        let cred: CredentialRec = self.get(&path)?.ok_or_else(|| StoreError::NotFound(cid.into()))?;
+        let cred: CredentialRec = self
+            .get(&path)?
+            .ok_or_else(|| StoreError::NotFound(cid.into()))?;
         self.sys.commit(
-            vec![Op::Remove { path }, Op::Remove { path: lookup_path(&cred) }],
+            vec![
+                Op::Remove { path },
+                Op::Remove {
+                    path: lookup_path(&cred),
+                },
+            ],
             &[],
         )?;
         Ok(())
@@ -777,7 +855,9 @@ impl Auth {
         }
         Pointer::parse(path)?;
         if PermSet::parse(perms)? == PermSet::default() {
-            return Err(StoreError::Unsupported("a grant needs at least one permission".into()));
+            return Err(StoreError::Unsupported(
+                "a grant needs at least one permission".into(),
+            ));
         }
         let gid = format!("g_{}", random_hex::<8>());
         let rec = GrantRec {
@@ -787,7 +867,8 @@ impl Auth {
             created_ms: now_ms(),
             created_by: created_by.map(String::from),
         };
-        self.sys.commit(vec![put_op(sp(&["grants", &gid]), &rec)?], &[])?;
+        self.sys
+            .commit(vec![put_op(sp(&["grants", &gid]), &rec)?], &[])?;
         Ok(gid)
     }
 

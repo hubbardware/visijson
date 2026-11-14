@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
+use serde_json::json;
 use visijson::model::Pointer;
 use visijson::store::Store;
 use visijson::subscriptions::is_relevant;
-use serde_json::json;
 
 #[tokio::test]
 async fn events_arrive_in_version_order_without_gaps() {
@@ -45,8 +45,7 @@ async fn snapshot_and_stream_are_consistent_under_concurrent_writes() {
         let (snapshot, mut rx) = store.subscribe();
         // The next relevant event (writers touch /n every commit) must be
         // contiguous with the snapshot.
-        if let Ok(ev) =
-            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        if let Ok(ev) = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
         {
             let ev = ev.unwrap();
             assert_eq!(

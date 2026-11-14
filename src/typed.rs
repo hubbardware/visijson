@@ -263,7 +263,10 @@ impl ser::SerializeMap for MapSer {
         Ok(())
     }
     fn serialize_value<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), SerError> {
-        let key = self.key.take().expect("serialize_value before serialize_key");
+        let key = self
+            .key
+            .take()
+            .expect("serialize_value before serialize_key");
         self.map.insert(key, v.serialize(NodeSer)?);
         Ok(())
     }
@@ -430,7 +433,9 @@ fn diff_sorted_entries<'a, V: Document + 'a>(
             (Some(&(ko, _)), Some(&(kn, _))) => match ko.cmp(kn) {
                 std::cmp::Ordering::Less => {
                     path.push(ko.as_str());
-                    ops.push(Op::Remove { path: path.render() });
+                    ops.push(Op::Remove {
+                        path: path.render(),
+                    });
                     path.pop();
                     io.next();
                 }
@@ -451,7 +456,9 @@ fn diff_sorted_entries<'a, V: Document + 'a>(
             (Some(_), None) => {
                 let (k, _) = io.next().unwrap();
                 path.push(k.as_str());
-                ops.push(Op::Remove { path: path.render() });
+                ops.push(Op::Remove {
+                    path: path.render(),
+                });
                 path.pop();
             }
             (None, Some(_)) => {

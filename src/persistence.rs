@@ -225,16 +225,15 @@ impl Persistence {
     /// modification index starts at the snapshot as its floor and is
     /// sharpened by every replayed commit. Call before `start_writer`.
     pub fn recover(&self) -> Result<Recovered> {
-        let (mut version, mut time_ms, mut root, snap_mods) =
-            match fs::read(&self.snapshot_path) {
-                Ok(bytes) => {
-                    let snap: SnapshotFile = serde_json::from_slice(&bytes)?;
-                    tracing::info!(version = snap.version, "recovered snapshot");
-                    (snap.version, snap.time_ms, Arc::new(snap.root), snap.mods)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0, empty_object(), None),
-                Err(e) => return Err(e.into()),
-            };
+        let (mut version, mut time_ms, mut root, snap_mods) = match fs::read(&self.snapshot_path) {
+            Ok(bytes) => {
+                let snap: SnapshotFile = serde_json::from_slice(&bytes)?;
+                tracing::info!(version = snap.version, "recovered snapshot");
+                (snap.version, snap.time_ms, Arc::new(snap.root), snap.mods)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0, empty_object(), None),
+            Err(e) => return Err(e.into()),
+        };
         // Seed the idle-skip watermark: the on-disk snapshot already covers
         // exactly this version.
         *self.last_snapshot.lock().unwrap() = version;

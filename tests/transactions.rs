@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use serde_json::json;
 use visijson::error::StoreError;
 use visijson::store::{Condition, Op, Store, StoreConfig};
-use serde_json::json;
 
 #[test]
 fn read_modify_write_conflict_forces_retry() {

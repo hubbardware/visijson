@@ -27,12 +27,9 @@ pub fn derive_document(input: TokenStream) -> TokenStream {
             }
         },
         _ => {
-            return syn::Error::new_spanned(
-                &ast.ident,
-                "#[derive(Document)] only supports structs",
-            )
-            .to_compile_error()
-            .into()
+            return syn::Error::new_spanned(&ast.ident, "#[derive(Document)] only supports structs")
+                .to_compile_error()
+                .into()
         }
     };
 

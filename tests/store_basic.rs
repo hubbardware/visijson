@@ -1,8 +1,8 @@
 //! Basic store semantics: pointers, path-copy writes, structural sharing,
 //! changed-path recording.
 
-use visijson::store::{shares_subtree, Store};
 use serde_json::json;
+use visijson::store::{shares_subtree, Store};
 
 #[test]
 fn put_get_roundtrip() {
@@ -61,7 +61,11 @@ fn put_records_only_genuinely_changed_paths() {
     let info = store
         .put("/info", json!({"time": "t2", "uptime": 2, "started": "t0"}))
         .unwrap();
-    assert!(info.changed_paths.is_empty(), "got {:?}", info.changed_paths);
+    assert!(
+        info.changed_paths.is_empty(),
+        "got {:?}",
+        info.changed_paths
+    );
     assert_eq!(info.version, v_before);
     assert_eq!(store.version(), v_before);
 
@@ -116,8 +120,11 @@ fn array_insert_and_remove_report_the_whole_array() {
 fn merge_op_follows_rfc7396() {
     let store = Store::in_memory();
     store
-        .put("", json!({"title": "Goodbye!", "author": {"givenName": "John", "familyName": "Doe"},
-                        "tags": ["example", "sample"], "content": "This will be unchanged"}))
+        .put(
+            "",
+            json!({"title": "Goodbye!", "author": {"givenName": "John", "familyName": "Doe"},
+                        "tags": ["example", "sample"], "content": "This will be unchanged"}),
+        )
         .unwrap();
 
     // The example straight from RFC 7396 §1.
@@ -154,7 +161,11 @@ fn identical_put_does_not_wake_formulas() {
     // Re-putting the same value produces no changed paths, so the dependent
     // formula must not appear in changed paths either.
     let info = store.put("/a", json!(5)).unwrap();
-    assert!(info.changed_paths.is_empty(), "got {:?}", info.changed_paths);
+    assert!(
+        info.changed_paths.is_empty(),
+        "got {:?}",
+        info.changed_paths
+    );
     assert_eq!(store.get("/f").unwrap(), Some(json!(10)));
 }
 
@@ -221,7 +232,10 @@ fn full_replace_reconciles_structural_sharing() {
     use visijson::store::shares_subtree;
     let store = Store::in_memory();
     store
-        .put("/things", json!({"t1": {"v": 1}, "t2": {"v": 2}, "t3": {"v": 3}}))
+        .put(
+            "/things",
+            json!({"t1": {"v": 1}, "t2": {"v": 2}, "t3": {"v": 3}}),
+        )
         .unwrap();
     let before = store.head();
 
@@ -229,7 +243,10 @@ fn full_replace_reconciles_structural_sharing() {
     // untouched entries must keep their old Arcs, and the diff must report
     // only the real change.
     let info = store
-        .put("/things", json!({"t1": {"v": 1}, "t2": {"v": 99}, "t3": {"v": 3}}))
+        .put(
+            "/things",
+            json!({"t1": {"v": 1}, "t2": {"v": 99}, "t3": {"v": 3}}),
+        )
         .unwrap();
     assert_eq!(info.changed_paths, vec!["/things/t2/v"]);
     let after = store.head();

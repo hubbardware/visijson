@@ -1,9 +1,9 @@
 //! Formula correctness: evaluation, dependency-driven re-evaluation in
 //! topological order, cycle rejection, and error propagation.
 
+use serde_json::json;
 use visijson::error::StoreError;
 use visijson::store::Store;
-use serde_json::json;
 
 fn formula(expr: &str) -> serde_json::Value {
     json!({ "$formula": expr })
@@ -60,7 +60,9 @@ fn chained_formulas_evaluate_in_topological_order() {
 fn formula_referencing_ancestor_subtree() {
     let store = Store::in_memory();
     store.put("/order/items", json!([10, 20, 30])).unwrap();
-    store.put("/order/total", formula("sum(/order/items)")).unwrap();
+    store
+        .put("/order/total", formula("sum(/order/items)"))
+        .unwrap();
     assert_eq!(store.get("/order/total").unwrap(), Some(json!(60)));
 
     // Changing one element re-evaluates (dependency is an ancestor overlap).
@@ -161,7 +163,10 @@ fn division_by_zero_yields_error_value() {
 fn parse_error_rejects_the_commit() {
     let store = Store::in_memory();
     let err = store.put("/bad", formula("1 + + 2)")).unwrap_err();
-    assert!(matches!(err, StoreError::FormulaParse { .. }), "got {err:?}");
+    assert!(
+        matches!(err, StoreError::FormulaParse { .. }),
+        "got {err:?}"
+    );
     assert_eq!(store.get("/bad").unwrap(), None);
 }
 
@@ -187,7 +192,9 @@ fn deep_formula_chain_evaluates_without_recursion() {
     for i in 1..5000 {
         chain.insert(format!("f{i}"), formula(&format!("/chain/f{} + 1", i - 1)));
     }
-    store.put("/chain", serde_json::Value::Object(chain)).unwrap();
+    store
+        .put("/chain", serde_json::Value::Object(chain))
+        .unwrap();
     assert_eq!(store.get("/chain/f4999").unwrap(), Some(json!(5000)));
 
     // One base write ripples the whole chain in a single commit.
@@ -221,7 +228,9 @@ fn jq_extracts_player_names_as_array() {
         .unwrap();
 
     // Bare values, 1-field objects, n-field objects, keyed by uid.
-    store.put("/names", formula("jq(/players, '[.[] | .name]')")).unwrap();
+    store
+        .put("/names", formula("jq(/players, '[.[] | .name]')"))
+        .unwrap();
     store
         .put("/cards", formula("jq(/players, '[.[] | {name, age}]')"))
         .unwrap();
@@ -248,7 +257,9 @@ fn jq_reevaluates_when_scope_changes_only() {
     let store = Store::in_memory();
     store.put("/players/u1/name", json!("alice")).unwrap();
     store.put("/other", json!(0)).unwrap();
-    store.put("/names", formula("jq(/players, '[.[] | .name]')")).unwrap();
+    store
+        .put("/names", formula("jq(/players, '[.[] | .name]')"))
+        .unwrap();
     assert_eq!(store.get("/names").unwrap(), Some(json!(["alice"])));
 
     // A new player under the scope re-evaluates the view.
@@ -268,7 +279,10 @@ fn jq_composes_with_numeric_functions() {
         .put("/players", json!({"u1": {"age": 30}, "u2": {"age": 20}}))
         .unwrap();
     store
-        .put("/avg_age", formula("sum(jq(/players, '[.[] | .age]')) / count(jq(/players, '[.[] | .age]'))"))
+        .put(
+            "/avg_age",
+            formula("sum(jq(/players, '[.[] | .age]')) / count(jq(/players, '[.[] | .age]'))"),
+        )
         .unwrap();
     assert_eq!(store.get("/avg_age").unwrap(), Some(json!(25)));
 }
@@ -277,7 +291,9 @@ fn jq_composes_with_numeric_functions() {
 fn jq_errors_surface_and_heal() {
     let store = Store::in_memory();
     // Missing scope → #ERR that heals when the scope appears.
-    store.put("/names", formula("jq(/players, '[.[] | .name]')")).unwrap();
+    store
+        .put("/names", formula("jq(/players, '[.[] | .name]')"))
+        .unwrap();
     let v = store.get("/names").unwrap().unwrap();
     assert!(v.as_str().unwrap().starts_with("#ERR"), "got {v}");
     store.put("/players/u1/name", json!("alice")).unwrap();
@@ -285,7 +301,9 @@ fn jq_errors_surface_and_heal() {
 
     // A stream of outputs is rejected with a hint, not silently truncated.
     store.put("/players/u2/name", json!("bob")).unwrap();
-    store.put("/stream", formula("jq(/players, '.[] | .name')")).unwrap();
+    store
+        .put("/stream", formula("jq(/players, '.[] | .name')"))
+        .unwrap();
     let v = store.get("/stream").unwrap().unwrap();
     assert!(v.as_str().unwrap().contains("[...]"), "got {v}");
 
@@ -313,7 +331,9 @@ fn formula_in_array_survives_sibling_insert_shift() {
     use visijson::store::Op;
     let store = Store::in_memory();
     store.put("/x", json!(1)).unwrap();
-    store.put("/arr", json!([{"$formula": "/x + 1"}, "plain"])).unwrap();
+    store
+        .put("/arr", json!([{"$formula": "/x + 1"}, "plain"]))
+        .unwrap();
     assert_eq!(store.get("/arr/0").unwrap(), Some(json!(2)));
 
     // Insert at the front: the formula shifts to /arr/1. The index must
@@ -337,7 +357,10 @@ fn formulas_created_and_destroyed_by_deep_subtree_writes() {
     let store = Store::in_memory();
     // Formula born inside a larger object write, not written directly.
     store
-        .put("/data", json!({"a": {"f": {"$formula": "/data/a/x * 2"}, "x": 3}}))
+        .put(
+            "/data",
+            json!({"a": {"f": {"$formula": "/data/a/x * 2"}, "x": 3}}),
+        )
         .unwrap();
     assert_eq!(store.get("/data/a/f").unwrap(), Some(json!(6)));
     store.put("/data/a/x", json!(5)).unwrap();

@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use visijson::api::router;
-use visijson::store::Store;
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use visijson::api::router;
+use visijson::store::Store;
 
 async fn serve() -> (String, Arc<Store>, Arc<Store>) {
     let store = Store::in_memory();
@@ -87,7 +87,14 @@ async fn rest_crud_roundtrip() {
     assert_eq!(resp.status(), 404);
 
     // GET whole document
-    let v: Value = client.get(format!("{base}/doc")).send().await.unwrap().json().await.unwrap();
+    let v: Value = client
+        .get(format!("{base}/doc"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v, json!({"users": {"alice": {"tags": ["admin", "ops"]}}}));
 }
 
@@ -115,7 +122,14 @@ async fn patch_add_replace_remove_test() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let v: Value = client.get(format!("{base}/doc")).send().await.unwrap().json().await.unwrap();
+    let v: Value = client
+        .get(format!("{base}/doc"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v, json!({"list": [1, 2, 3], "keep": false}));
 
     // Failing `test` op → 409 and no change
@@ -130,7 +144,14 @@ async fn patch_add_replace_remove_test() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 409);
-    let v: Value = client.get(format!("{base}/doc/keep")).send().await.unwrap().json().await.unwrap();
+    let v: Value = client
+        .get(format!("{base}/doc/keep"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v, json!(false));
 }
 
@@ -152,14 +173,31 @@ async fn txn_endpoint_applies_atomically_with_conditions() {
         ],
         "conditions": [{"path": "/bal", "expected": 100}]
     });
-    let resp = client.post(format!("{base}/txn")).json(&txn).send().await.unwrap();
+    let resp = client
+        .post(format!("{base}/txn"))
+        .json(&txn)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // Same conditional txn again: /bal is now 70, so it must 409.
-    let resp = client.post(format!("{base}/txn")).json(&txn).send().await.unwrap();
+    let resp = client
+        .post(format!("{base}/txn"))
+        .json(&txn)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 409);
 
-    let v: Value = client.get(format!("{base}/doc")).send().await.unwrap().json().await.unwrap();
+    let v: Value = client
+        .get(format!("{base}/doc"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v, json!({"bal": 70, "ledger": [{"delta": -30}]}));
 }
 
@@ -167,7 +205,12 @@ async fn txn_endpoint_applies_atomically_with_conditions() {
 async fn formulas_over_rest() {
     let (base, _store, _info) = serve().await;
     let client = reqwest::Client::new();
-    client.put(format!("{base}/doc/a")).json(&json!(6)).send().await.unwrap();
+    client
+        .put(format!("{base}/doc/a"))
+        .json(&json!(6))
+        .send()
+        .await
+        .unwrap();
     client
         .put(format!("{base}/doc/double"))
         .json(&json!({"$formula": "/a * 2"}))
@@ -175,7 +218,14 @@ async fn formulas_over_rest() {
         .await
         .unwrap();
 
-    let v: Value = client.get(format!("{base}/doc/double")).send().await.unwrap().json().await.unwrap();
+    let v: Value = client
+        .get(format!("{base}/doc/double"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v, json!(12));
 
     let raw: Value = client
@@ -445,12 +495,16 @@ async fn info_ticker_heartbeats_beside_the_doc() {
     let (_, mut rx) = info.subscribe();
     let ev = rx.recv().await.unwrap();
     assert!(
-        ev.changed_paths.iter().any(|p| p == "/time" || p == "/epoch_ms"),
+        ev.changed_paths
+            .iter()
+            .any(|p| p == "/time" || p == "/epoch_ms"),
         "got {:?}",
         ev.changed_paths
     );
     assert!(
-        !ev.changed_paths.iter().any(|p| p == "/started" || p.is_empty()),
+        !ev.changed_paths
+            .iter()
+            .any(|p| p == "/started" || p.is_empty()),
         "unchanged fields flagged: {:?}",
         ev.changed_paths
     );
@@ -565,9 +619,15 @@ async fn websocket_subscribers_watching_different_paths() {
     }
     // Subscribed directly at /a and /b, so the patch path is the root: "".
     let a_msg = next(&mut ws_a).await;
-    assert_eq!(a_msg["patch"], json!([{"op": "replace", "path": "", "value": 1}]));
+    assert_eq!(
+        a_msg["patch"],
+        json!([{"op": "replace", "path": "", "value": 1}])
+    );
     let b_msg = next(&mut ws_b).await;
-    assert_eq!(b_msg["patch"], json!([{"op": "replace", "path": "", "value": 2}]));
+    assert_eq!(
+        b_msg["patch"],
+        json!([{"op": "replace", "path": "", "value": 2}])
+    );
 }
 
 #[tokio::test]
@@ -589,10 +649,19 @@ async fn websocket_json_patch_add_and_remove_ops() {
         let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
         patches.push(v["patch"].clone());
     }
-    assert_eq!(patches[0], json!([{"op": "add", "path": "/fresh", "value": "new"}]));
+    assert_eq!(
+        patches[0],
+        json!([{"op": "add", "path": "/fresh", "value": "new"}])
+    );
     assert_eq!(patches[1], json!([{"op": "remove", "path": "/gone"}]));
-    assert_eq!(patches[2], json!([{"op": "add", "path": "/list", "value": [1]}]));
-    assert_eq!(patches[3], json!([{"op": "add", "path": "/list/1", "value": 2}]));
+    assert_eq!(
+        patches[2],
+        json!([{"op": "add", "path": "/list", "value": [1]}])
+    );
+    assert_eq!(
+        patches[3],
+        json!([{"op": "add", "path": "/list/1", "value": 2}])
+    );
 }
 
 #[tokio::test]
@@ -693,10 +762,16 @@ async fn sse_snapshot_then_filtered_changes() {
 
     let (id1, kind, ev1) = next_sse(&mut resp, &mut buf).await;
     assert_eq!(kind, "change");
-    assert_eq!(ev1["patch"], json!([{"op": "replace", "path": "/n", "value": 1}]));
+    assert_eq!(
+        ev1["patch"],
+        json!([{"op": "replace", "path": "/n", "value": 1}])
+    );
     assert!(id1 > snap_id);
     let (id2, _, ev2) = next_sse(&mut resp, &mut buf).await;
-    assert_eq!(ev2["patch"], json!([{"op": "replace", "path": "/n", "value": 2}]));
+    assert_eq!(
+        ev2["patch"],
+        json!([{"op": "replace", "path": "/n", "value": 2}])
+    );
     assert!(id2 > id1);
 }
 
@@ -734,8 +809,14 @@ async fn sse_reconnect_resumes_without_snapshot_when_current() {
     store.put("/w/n", json!(1)).unwrap();
     let mut buf = String::new();
     let (id, kind, ev) = next_sse(&mut resp, &mut buf).await;
-    assert_eq!(kind, "change", "resumable reconnect must not resend a snapshot");
-    assert_eq!(ev["patch"], json!([{"op": "replace", "path": "/n", "value": 1}]));
+    assert_eq!(
+        kind, "change",
+        "resumable reconnect must not resend a snapshot"
+    );
+    assert_eq!(
+        ev["patch"],
+        json!([{"op": "replace", "path": "/n", "value": 1}])
+    );
     assert!(id > seen_id);
     drop(resp);
 
@@ -777,7 +858,10 @@ async fn conditional_gets_with_etag_and_if_modified_since() {
     let resp = client.get(format!("{base}/doc/a")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let etag = resp.headers()["etag"].to_str().unwrap().to_string();
-    let last_mod = resp.headers()["last-modified"].to_str().unwrap().to_string();
+    let last_mod = resp.headers()["last-modified"]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert_eq!(resp.headers()["cache-control"], "no-cache");
     assert!(last_mod.ends_with(" GMT"), "got {last_mod}");
 
@@ -841,7 +925,10 @@ async fn conditional_gets_with_etag_and_if_modified_since() {
 
     // If-Modified-Since, using the date the server itself reported.
     let resp = client.get(format!("{base}/doc/a")).send().await.unwrap();
-    let last_mod = resp.headers()["last-modified"].to_str().unwrap().to_string();
+    let last_mod = resp.headers()["last-modified"]
+        .to_str()
+        .unwrap()
+        .to_string();
     let resp = client
         .get(format!("{base}/doc/a"))
         .header("if-modified-since", &last_mod)
@@ -881,7 +968,11 @@ async fn snapshot_distinguishes_absent_from_null() {
     let client = reqwest::Client::new();
 
     // A plain GET of a missing path is still a 404 …
-    let resp = client.get(format!("{base}/doc/nothing")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/doc/nothing"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
     // … but a subscription succeeds and says so explicitly.
@@ -901,7 +992,10 @@ async fn snapshot_distinguishes_absent_from_null() {
     store.put("/nothing", json!({"a": 1})).unwrap();
     let (_, kind, ev) = next_sse(&mut resp, &mut buf).await;
     assert_eq!(kind, "change");
-    assert_eq!(ev["patch"], json!([{"op": "add", "path": "", "value": {"a": 1}}]));
+    assert_eq!(
+        ev["patch"],
+        json!([{"op": "add", "path": "", "value": {"a": 1}}])
+    );
 
     // A path explicitly set to JSON null exists.
     store.put("/reallynull", json!(null)).unwrap();

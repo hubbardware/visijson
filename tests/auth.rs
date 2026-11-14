@@ -58,7 +58,10 @@ impl Server {
             .await
             .unwrap();
         assert_eq!(resp.status(), 201);
-        let pid = resp.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string();
+        let pid = resp.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let token = self.login(name, "correct horse").await;
         (pid, token)
     }
@@ -88,7 +91,10 @@ impl Server {
             .await
             .unwrap();
         assert_eq!(resp.status(), 201);
-        resp.json::<Value>().await.unwrap()["id"].as_str().unwrap().to_string()
+        resp.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     async fn put(&self, token: &str, path: &str, body: Value) -> reqwest::StatusCode {
@@ -161,7 +167,11 @@ async fn anonymous_is_401_until_a_public_grant_exists() {
     s.grant("group:anonymous", "/public", &["read"]).await;
     assert_eq!(s.get(None, "/doc/public/news").await.status(), 200);
     assert_eq!(s.get(None, "/doc/private").await.status(), 401);
-    assert_eq!(s.get(None, "/doc").await.status(), 401, "no holes: root needs a root grant");
+    assert_eq!(
+        s.get(None, "/doc").await.status(),
+        401,
+        "no holes: root needs a root grant"
+    );
     // /info stays public regardless.
     assert_ne!(s.get(None, "/info").await.status(), 401);
     // The UI shell is served to anyone; data still needs a grant.
@@ -179,9 +189,15 @@ async fn anonymous_is_401_until_a_public_grant_exists() {
 async fn login_whoami_logout() {
     let s = serve().await;
     let (pid, token) = s.user("alice").await;
-    s.grant(&format!("principal:{pid}"), "/teamA", &["read", "write"]).await;
+    s.grant(&format!("principal:{pid}"), "/teamA", &["read", "write"])
+        .await;
 
-    let who: Value = s.get(Some(&token), "/auth/whoami").await.json().await.unwrap();
+    let who: Value = s
+        .get(Some(&token), "/auth/whoami")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert_eq!(who["principal"], json!(pid));
     assert_eq!(who["via"], "session");
     assert_eq!(who["anonymous"], false);
@@ -222,7 +238,11 @@ async fn login_whoami_logout() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(s.get(Some(&token), "/auth/whoami").await.status(), 401, "session is gone");
+    assert_eq!(
+        s.get(Some(&token), "/auth/whoami").await.status(),
+        401,
+        "session is gone"
+    );
 }
 
 #[tokio::test]
@@ -285,9 +305,12 @@ async fn conditions_and_formula_listing_need_read() {
     let s = serve().await;
     s.doc.put("/secret", json!(42)).unwrap();
     s.doc.put("/mine/f", json!({"$formula": "1 + 1"})).unwrap();
-    s.doc.put("/hidden/f", json!({"$formula": "2 + 2"})).unwrap();
+    s.doc
+        .put("/hidden/f", json!({"$formula": "2 + 2"}))
+        .unwrap();
     let (pid, token) = s.user("bob").await;
-    s.grant(&format!("principal:{pid}"), "/mine", &["read", "write"]).await;
+    s.grant(&format!("principal:{pid}"), "/mine", &["read", "write"])
+        .await;
 
     // A test op on /secret would reveal its value.
     let resp = s
@@ -317,17 +340,28 @@ async fn conditions_and_formula_listing_need_read() {
 async fn formulas_need_formula_perm_and_read_on_their_dependencies() {
     let s = serve().await;
     s.doc
-        .put("", json!({"raw": {"a": 2, "b": 3}, "salary": 100, "views": {}}))
+        .put(
+            "",
+            json!({"raw": {"a": 2, "b": 3}, "salary": 100, "views": {}}),
+        )
         .unwrap();
     let (pid, token) = s.user("analyst").await;
     let me = format!("principal:{pid}");
     s.grant(&me, "/views", &["read", "write"]).await;
 
     let sum = json!({"$formula": "/raw/a + /raw/b"});
-    assert_eq!(s.put(&token, "/views/total", sum.clone()).await, 403, "write alone can't define formulas");
+    assert_eq!(
+        s.put(&token, "/views/total", sum.clone()).await,
+        403,
+        "write alone can't define formulas"
+    );
 
     s.grant(&me, "/views", &["formula"]).await;
-    assert_eq!(s.put(&token, "/views/total", sum.clone()).await, 403, "can't read /raw yet");
+    assert_eq!(
+        s.put(&token, "/views/total", sum.clone()).await,
+        403,
+        "can't read /raw yet"
+    );
     let peek = json!({"$formula": "/salary"});
     assert_eq!(s.put(&token, "/views/peek", peek).await, 403);
 
@@ -338,15 +372,22 @@ async fn formulas_need_formula_perm_and_read_on_their_dependencies() {
     // Definer's rights: a reader of /views sees the computed value without
     // any access to /raw.
     let (rpid, rtoken) = s.user("reader").await;
-    s.grant(&format!("principal:{rpid}"), "/views", &["read"]).await;
-    let v: Value = s.get(Some(&rtoken), "/doc/views/total").await.json().await.unwrap();
+    s.grant(&format!("principal:{rpid}"), "/views", &["read"])
+        .await;
+    let v: Value = s
+        .get(Some(&rtoken), "/doc/views/total")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v, json!(5));
     assert_eq!(s.get(Some(&rtoken), "/doc/raw").await.status(), 403);
 
     // A plain writer re-PUTting a subtree that already holds an unchanged
     // formula doesn't need `formula` — nothing about the formula changed.
     let (wpid, wtoken) = s.user("writer").await;
-    s.grant(&format!("principal:{wpid}"), "/views", &["read", "write"]).await;
+    s.grant(&format!("principal:{wpid}"), "/views", &["read", "write"])
+        .await;
     let raw: Value = s
         .http
         .get(s.url("/doc/views?raw=true"))
@@ -369,9 +410,12 @@ async fn formulas_need_formula_perm_and_read_on_their_dependencies() {
 #[tokio::test]
 async fn api_keys_scope_down_never_up() {
     let s = serve().await;
-    s.doc.put("", json!({"public": {"n": 1}, "other": 1})).unwrap();
+    s.doc
+        .put("", json!({"public": {"n": 1}, "other": 1}))
+        .unwrap();
     let (pid, token) = s.user("carol").await;
-    s.grant(&format!("principal:{pid}"), "", &["read", "write"]).await;
+    s.grant(&format!("principal:{pid}"), "", &["read", "write"])
+        .await;
 
     let resp = s
         .http
@@ -388,7 +432,11 @@ async fn api_keys_scope_down_never_up() {
 
     assert_eq!(s.get(Some(&k), "/doc/public/n").await.status(), 200);
     assert_eq!(s.get(Some(&k), "/doc/other").await.status(), 403);
-    assert_eq!(s.put(&k, "/public/n", json!(2)).await, 403, "scope is read-only");
+    assert_eq!(
+        s.put(&k, "/public/n", json!(2)).await,
+        403,
+        "scope is read-only"
+    );
 
     // A scoped key can't mint itself something wider.
     let resp = s
@@ -402,7 +450,12 @@ async fn api_keys_scope_down_never_up() {
     assert_eq!(resp.status(), 403);
 
     // Listing never exposes secrets; deleting revokes.
-    let listed: Value = s.get(Some(&token), "/auth/keys").await.json().await.unwrap();
+    let listed: Value = s
+        .get(Some(&token), "/auth/keys")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert!(!listed.to_string().contains(&k[k.len() - 20..]));
     let cid = key["credential"].as_str().unwrap();
     let resp = s
@@ -416,14 +469,18 @@ async fn api_keys_scope_down_never_up() {
     assert_eq!(s.get(Some(&k), "/doc/public/n").await.status(), 401);
 
     // Garbage tokens are a hard 401, not a silent anonymous.
-    assert_eq!(s.get(Some("vjk_nope_nope"), "/doc/public").await.status(), 401);
+    assert_eq!(
+        s.get(Some("vjk_nope_nope"), "/doc/public").await.status(),
+        401
+    );
 }
 
 #[tokio::test]
 async fn cookie_sessions_need_the_csrf_header_and_stale_cookies_fall_back() {
     let s = serve().await;
     let (pid, _) = s.user("dave").await;
-    s.grant(&format!("principal:{pid}"), "", &["read", "write"]).await;
+    s.grant(&format!("principal:{pid}"), "", &["read", "write"])
+        .await;
     let resp = s
         .http
         .post(s.url("/auth/login"))
@@ -449,7 +506,13 @@ async fn cookie_sessions_need_the_csrf_header_and_stale_cookies_fall_back() {
     assert_eq!(put(false).await.unwrap().status(), 403);
     assert_eq!(put(true).await.unwrap().status(), 200);
     // Reads by cookie need no header.
-    let resp = s.http.get(s.url("/doc/x")).header("cookie", &cookie).send().await.unwrap();
+    let resp = s
+        .http
+        .get(s.url("/doc/x"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // A stale cookie degrades to anonymous rather than blocking re-login.
@@ -473,16 +536,25 @@ async fn cookie_websocket_upgrade_requires_same_origin() {
     let host = s.base.trim_start_matches("http://").to_string();
 
     let mut req = ws_url.as_str().into_client_request().unwrap();
-    req.headers_mut().insert("cookie", format!("vj_session={token}").parse().unwrap());
-    req.headers_mut().insert("origin", "http://evil.example".parse().unwrap());
+    req.headers_mut()
+        .insert("cookie", format!("vj_session={token}").parse().unwrap());
+    req.headers_mut()
+        .insert("origin", "http://evil.example".parse().unwrap());
     assert!(tokio_tungstenite::connect_async(req).await.is_err());
 
     let mut req = ws_url.as_str().into_client_request().unwrap();
-    req.headers_mut().insert("cookie", format!("vj_session={token}").parse().unwrap());
-    req.headers_mut().insert("origin", format!("http://{host}").parse().unwrap());
+    req.headers_mut()
+        .insert("cookie", format!("vj_session={token}").parse().unwrap());
+    req.headers_mut()
+        .insert("origin", format!("http://{host}").parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    let Some(Ok(Message::Text(t))) = ws.next().await else { panic!("no snapshot") };
-    assert_eq!(serde_json::from_str::<Value>(&t).unwrap()["type"], "snapshot");
+    let Some(Ok(Message::Text(t))) = ws.next().await else {
+        panic!("no snapshot")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(&t).unwrap()["type"],
+        "snapshot"
+    );
 }
 
 async fn next_frame(resp: &mut reqwest::Response, buf: &mut String) -> Option<String> {
@@ -521,11 +593,26 @@ async fn tickets_are_single_use_stream_credentials() {
         .unwrap();
     let ticket = t["ticket"].as_str().unwrap();
     let url = s.url(&format!("/doc/w?ticket={ticket}"));
-    let mut resp = s.http.get(&url).header("accept", "text/event-stream").send().await.unwrap();
+    let mut resp = s
+        .http
+        .get(&url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let mut buf = String::new();
-    assert!(next_frame(&mut resp, &mut buf).await.unwrap().contains("event: snapshot"));
-    let again = s.http.get(&url).header("accept", "text/event-stream").send().await.unwrap();
+    assert!(next_frame(&mut resp, &mut buf)
+        .await
+        .unwrap()
+        .contains("event: snapshot"));
+    let again = s
+        .http
+        .get(&url)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(again.status(), 401, "a ticket authorizes one connection");
     // Anonymous can't mint tickets.
     let resp = s.http.post(s.url("/auth/ticket")).send().await.unwrap();
@@ -552,20 +639,29 @@ async fn revoking_a_grant_closes_live_streams() {
     next_frame(&mut sse, &mut buf).await.unwrap();
 
     // WebSocket
-    let mut req = (s.base.replace("http://", "ws://") + "/doc/w").into_client_request().unwrap();
-    req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let mut req = (s.base.replace("http://", "ws://") + "/doc/w")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.next().await.unwrap().unwrap(); // snapshot
 
     // Still live: a change arrives on both.
     s.doc.put("/w", json!(1)).unwrap();
-    assert!(next_frame(&mut sse, &mut buf).await.unwrap().contains("event: change"));
+    assert!(next_frame(&mut sse, &mut buf)
+        .await
+        .unwrap()
+        .contains("event: change"));
     ws.next().await.unwrap().unwrap();
 
     // Unrelated sys churn (another login) re-validates but keeps them open.
     s.user("unrelated").await;
     s.doc.put("/w", json!(2)).unwrap();
-    assert!(next_frame(&mut sse, &mut buf).await.unwrap().contains("event: change"));
+    assert!(next_frame(&mut sse, &mut buf)
+        .await
+        .unwrap()
+        .contains("event: change"));
     ws.next().await.unwrap().unwrap();
 
     let resp = s
@@ -576,8 +672,15 @@ async fn revoking_a_grant_closes_live_streams() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(next_frame(&mut sse, &mut buf).await, None, "SSE stream ends");
-    match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap() {
+    assert_eq!(
+        next_frame(&mut sse, &mut buf).await,
+        None,
+        "SSE stream ends"
+    );
+    match tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+    {
         Some(Ok(Message::Close(Some(f)))) => assert_eq!(f.reason, "access revoked"),
         other => panic!("expected a close frame, got {other:?}"),
     }
@@ -635,21 +738,32 @@ async fn path_admins_delegate_within_their_subtree() {
     let s = serve().await;
     let (lead, lead_token) = s.user("lead").await;
     let (member, member_token) = s.user("member").await;
-    s.grant(&format!("principal:{lead}"), "/teamA", &["admin"]).await;
+    s.grant(&format!("principal:{lead}"), "/teamA", &["admin"])
+        .await;
     s.doc.put("/teamA/x", json!(1)).unwrap();
 
     let grant = |path: &str| {
         s.http
             .post(s.url("/auth/grants"))
             .bearer_auth(&lead_token)
-            .json(&json!({"subject": format!("principal:{member}"), "path": path, "perms": ["read"]}))
+            .json(
+                &json!({"subject": format!("principal:{member}"), "path": path, "perms": ["read"]}),
+            )
             .send()
     };
     assert_eq!(grant("/teamA/x").await.unwrap().status(), 201);
     assert_eq!(grant("/teamB").await.unwrap().status(), 403);
-    assert_eq!(s.get(Some(&member_token), "/doc/teamA/x").await.status(), 200);
+    assert_eq!(
+        s.get(Some(&member_token), "/doc/teamA/x").await.status(),
+        200
+    );
     // The lead sees only grants under what they administer.
-    let listed: Value = s.get(Some(&lead_token), "/auth/grants").await.json().await.unwrap();
+    let listed: Value = s
+        .get(Some(&lead_token), "/auth/grants")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert!(listed["grants"]
         .as_array()
         .unwrap()
@@ -683,7 +797,13 @@ fn wal_records_the_actor() {
     for e in std::fs::read_dir(dir.path().join("wal")).unwrap() {
         wal.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
     }
-    let records: Vec<Value> = wal.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let records: Vec<Value> = wal
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     assert_eq!(records[0]["actor"], "p_test");
-    assert!(records[1].get("actor").is_none(), "anonymous library commits record no actor");
+    assert!(
+        records[1].get("actor").is_none(),
+        "anonymous library commits record no actor"
+    );
 }
