@@ -3,9 +3,9 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::json;
 use visijson::store::Store;
 use visijson::typed::{to_node, Document, TypedMount};
-use serde_json::json;
 
 #[derive(Document, Clone)]
 struct Player {

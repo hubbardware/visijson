@@ -107,7 +107,9 @@ async fn identify(
             .to_str()
             .ok()
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| StoreError::Unauthorized("use `Authorization: Bearer <token>`".into()))?;
+            .ok_or_else(|| {
+                StoreError::Unauthorized("use `Authorization: Bearer <token>`".into())
+            })?;
         return auth.authenticate(token.trim(), false);
     }
     if let Some(token) = cookie(headers, SESSION_COOKIE) {
@@ -144,10 +146,15 @@ fn cookie_rules(caller: &Caller, req: &Request) -> Result<(), StoreError> {
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
     if upgrade {
         if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-            let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
             let origin_host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
             if origin_host != host {
-                return Err(StoreError::Forbidden("cross-origin WebSocket upgrade".into()));
+                return Err(StoreError::Forbidden(
+                    "cross-origin WebSocket upgrade".into(),
+                ));
             }
         }
     }
@@ -187,14 +194,25 @@ pub fn routes(auth: AuthState) -> Router {
         .route("/auth/password", put(change_password))
         .route("/auth/keys", get(own_keys).post(mint_own_key))
         .route("/auth/keys/:cid", delete(delete_own_key))
-        .route("/auth/principals", get(list_principals).post(create_principal))
+        .route(
+            "/auth/principals",
+            get(list_principals).post(create_principal),
+        )
         .route(
             "/auth/principals/:pid",
-            get(get_principal).patch(patch_principal).delete(delete_principal),
+            get(get_principal)
+                .patch(patch_principal)
+                .delete(delete_principal),
         )
         .route("/auth/principals/:pid/password", put(admin_set_password))
-        .route("/auth/principals/:pid/keys", get(admin_keys).post(admin_mint_key))
-        .route("/auth/principals/:pid/credentials/:cid", delete(admin_delete_credential))
+        .route(
+            "/auth/principals/:pid/keys",
+            get(admin_keys).post(admin_mint_key),
+        )
+        .route(
+            "/auth/principals/:pid/credentials/:cid",
+            delete(admin_delete_credential),
+        )
         .route("/auth/grants", get(list_grants).post(create_grant))
         .route("/auth/grants/:gid", delete(delete_grant))
         .with_state(auth)
@@ -218,7 +236,11 @@ fn require_root_admin(caller: &Caller) -> Result<(), StoreError> {
 fn session_cookie(auth: &Auth, token: &str, max_age_secs: u64) -> String {
     format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}{}",
-        if auth.cfg.cookie_secure { "; Secure" } else { "" }
+        if auth.cfg.cookie_secure {
+            "; Secure"
+        } else {
+            ""
+        }
     )
 }
 
@@ -330,14 +352,18 @@ fn check_scope_within(caller: &Caller, req: &KeyRequest) -> Result<(), StoreErro
         return Ok(());
     };
     let Some(want) = &req.scope else {
-        return Err(StoreError::Forbidden("a scoped key can only mint scoped keys".into()));
+        return Err(StoreError::Forbidden(
+            "a scoped key can only mint scoped keys".into(),
+        ));
     };
     for (p, ps) in parse_scope(want)?.iter() {
         let covered = have
             .iter()
             .any(|(hp, hps)| hp.is_prefix_of(p) && ps.within(*hps));
         if !covered {
-            return Err(StoreError::Forbidden(format!("scope at {p} exceeds your own")));
+            return Err(StoreError::Forbidden(format!(
+                "scope at {p} exceeds your own"
+            )));
         }
     }
     Ok(())
@@ -428,8 +454,7 @@ async fn get_principal(
     let auth = enabled(auth)?;
     require_root_admin(&caller)?;
     let p = auth
-        .principal(&pid)
-        ?
+        .principal(&pid)?
         .ok_or_else(|| StoreError::NotFound(pid.clone()))?;
     Ok(Json(json!({
         "id": pid, "kind": p.kind, "display": p.display, "status": p.status, "groups": p.groups,
@@ -453,7 +478,8 @@ async fn patch_principal(
 ) -> R {
     let auth = enabled(auth)?;
     require_root_admin(&caller)?;
-    let rec = blocking(move || auth.update_principal(&pid, body.display, body.status, body.groups)).await?;
+    let rec = blocking(move || auth.update_principal(&pid, body.display, body.status, body.groups))
+        .await?;
     Ok(Json(rec).into_response())
 }
 
@@ -554,7 +580,9 @@ async fn create_grant(
     caller.require(Perm::Admin, &path)?;
     PermSet::parse(&body.perms)?;
     let by = caller.principal().map(String::from);
-    let gid = blocking(move || auth.add_grant(&body.subject, &body.path, &body.perms, by.as_deref())).await?;
+    let gid =
+        blocking(move || auth.add_grant(&body.subject, &body.path, &body.perms, by.as_deref()))
+            .await?;
     Ok((StatusCode::CREATED, Json(json!({"id": gid}))).into_response())
 }
 
@@ -565,8 +593,7 @@ async fn delete_grant(
 ) -> R {
     let auth = enabled(auth)?;
     let g = auth
-        .grant(&gid)
-        ?
+        .grant(&gid)?
         .ok_or_else(|| StoreError::NotFound(gid.clone()))?;
     let path = Pointer::parse(&g.path)?;
     caller.require(Perm::Admin, &path)?;

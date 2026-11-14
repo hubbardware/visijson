@@ -19,8 +19,8 @@ use crate::error::{Result, StoreError};
 use crate::formulas;
 use crate::meta::{ModIndex, Stamp};
 use crate::model::{
-    self, from_value, get_at, insert_at, nodes_equal, remove_at, set_at,
-    to_plain_value, to_raw_value, Node, Pointer,
+    self, from_value, get_at, insert_at, nodes_equal, remove_at, set_at, to_plain_value,
+    to_raw_value, Node, Pointer,
 };
 use crate::persistence::{Durability, Persistence, WalRecord};
 use crate::stats::Stats;
@@ -344,7 +344,9 @@ fn minimal_ops(root: &Arc<Node>, changed: &BTreeSet<Pointer>) -> Vec<Op> {
                 path: p.to_string(),
                 value: n,
             },
-            None => Op::Remove { path: p.to_string() },
+            None => Op::Remove {
+                path: p.to_string(),
+            },
         });
     }
     ops
@@ -630,8 +632,15 @@ impl Store {
                 // live in try_rebase.
                 if fchanged.is_empty() && next.formulas.same_as(&cur.formulas) {
                     if let Some(info) = self.try_rebase(
-                        cur, &prev, conditions, &next.root, &changed, &scan_roots, wal_ops,
-                        time_ms, ctx.actor,
+                        cur,
+                        &prev,
+                        conditions,
+                        &next.root,
+                        &changed,
+                        &scan_roots,
+                        wal_ops,
+                        time_ms,
+                        ctx.actor,
                     )? {
                         return Ok(Some(info));
                     }
@@ -641,7 +650,8 @@ impl Store {
         }
         Stats::bump(&self.stats.commits);
         let changed_paths = Arc::new(all.iter().map(|p| p.to_string()).collect::<Vec<_>>());
-        self.publish(next, changed_paths, wal_ops, ctx.actor).map(Some)
+        self.publish(next, changed_paths, wal_ops, ctx.actor)
+            .map(Some)
     }
 
     /// The lost-CAS fast path: if the winner's head still shares every
@@ -741,10 +751,12 @@ impl Store {
                     ops: p.ops.clone(),
                     actor: p.actor.as_deref().map(String::from),
                 };
-                persistence.enqueue(&record, event.clone()).inspect_err(|e| {
-                    tracing::error!(version = p.committed.version, error = %e,
+                persistence
+                    .enqueue(&record, event.clone())
+                    .inspect_err(|e| {
+                        tracing::error!(version = p.committed.version, error = %e,
                         "WAL enqueue failed; store is fail-stopped for writes");
-                })?;
+                    })?;
             }
             Ok(())
         })?;

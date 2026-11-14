@@ -174,11 +174,13 @@ fn wants_html(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .map(|accept| match (accept.find("text/html"), accept.find("application/json")) {
-            (Some(h), Some(j)) => h < j,
-            (Some(_), None) => true,
-            _ => false,
-        })
+        .map(
+            |accept| match (accept.find("text/html"), accept.find("application/json")) {
+                (Some(h), Some(j)) => h < j,
+                (Some(_), None) => true,
+                _ => false,
+            },
+        )
         .unwrap_or(false)
 }
 
@@ -379,8 +381,10 @@ async fn commit_as(
     conds: Vec<Condition>,
 ) -> ApiResult {
     check_conditions_readable(&caller, &conds)?;
-    Ok(Json(commit_blocking(move || store.commit_with(ops, &conds, caller.ctx())).await?)
-        .into_response())
+    Ok(
+        Json(commit_blocking(move || store.commit_with(ops, &conds, caller.ctx())).await?)
+            .into_response(),
+    )
 }
 
 /// One conditional write: `op` at `ptr`, guarded by any `If-Match` /
@@ -455,7 +459,11 @@ async fn post_root(
     Json(node): Json<Node>,
 ) -> ApiResult {
     let value = Arc::new(node);
-    write_one(store, caller, &headers, "", |path| Op::Append { path, value }).await
+    write_one(store, caller, &headers, "", |path| Op::Append {
+        path,
+        value,
+    })
+    .await
 }
 
 async fn post_path(
@@ -466,9 +474,8 @@ async fn post_path(
     Json(node): Json<Node>,
 ) -> ApiResult {
     let value = Arc::new(node);
-    write_one(store, caller, &headers, &pointer_of(&path), |path| Op::Append {
-        path,
-        value,
+    write_one(store, caller, &headers, &pointer_of(&path), |path| {
+        Op::Append { path, value }
     })
     .await
 }
@@ -489,8 +496,8 @@ async fn delete_path(
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult {
-    write_one(store, caller, &headers, &pointer_of(&path), |path| Op::Remove {
-        path,
+    write_one(store, caller, &headers, &pointer_of(&path), |path| {
+        Op::Remove { path }
     })
     .await
 }
@@ -505,7 +512,10 @@ struct PatchOp {
     value: Option<Value>,
 }
 
-fn patch_to_ops(prefix: &str, patch: Vec<PatchOp>) -> Result<(Vec<Op>, Vec<Condition>), StoreError> {
+fn patch_to_ops(
+    prefix: &str,
+    patch: Vec<PatchOp>,
+) -> Result<(Vec<Op>, Vec<Condition>), StoreError> {
     let mut ops = Vec::new();
     let mut conditions = Vec::new();
     for p in patch {
@@ -513,16 +523,19 @@ fn patch_to_ops(prefix: &str, patch: Vec<PatchOp>) -> Result<(Vec<Op>, Vec<Condi
         match p.op.as_str() {
             "add" => ops.push(Op::Insert {
                 path: full,
-                value: from_value(&p.value.ok_or_else(|| {
-                    StoreError::Unsupported("`add` requires a value".into())
-                })?),
+                value: from_value(
+                    &p.value
+                        .ok_or_else(|| StoreError::Unsupported("`add` requires a value".into()))?,
+                ),
             }),
-            "replace" => ops.push(Op::Put {
-                path: full,
-                value: from_value(&p.value.ok_or_else(|| {
-                    StoreError::Unsupported("`replace` requires a value".into())
-                })?),
-            }),
+            "replace" => {
+                ops.push(Op::Put {
+                    path: full,
+                    value: from_value(&p.value.ok_or_else(|| {
+                        StoreError::Unsupported("`replace` requires a value".into())
+                    })?),
+                })
+            }
             "remove" => ops.push(Op::Remove { path: full }),
             "test" => conditions.push(Condition {
                 path: full,
@@ -767,7 +780,10 @@ fn etag_for(stamp: Stamp, raw: bool) -> String {
 /// `If-None-Match` wins outright when present; `If-Modified-Since` is only
 /// consulted in its absence.
 fn is_not_modified(headers: &HeaderMap, etag: &str, time_ms: u64) -> bool {
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+    if let Some(inm) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
         let inm = inm.trim();
         if inm == "*" {
             return true;
@@ -819,7 +835,12 @@ fn subscribe(
     let offered: Vec<&str> = headers
         .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     let format = match offered.iter().find(|p| WS_PROTOCOLS.contains(p)) {
         Some(&"merge-patch") => PatchFormat::MergePatch,
@@ -854,9 +875,9 @@ async fn access_revoked(asker: Asker, ptr: Pointer) {
             Some(c) if c.allows(Perm::Read, &ptr) => caller = c,
             _ => return,
         }
-        let until_expiry = caller.expires_ms().map(|e| {
-            Duration::from_millis(e.saturating_sub(crate::store::now_ms()))
-        });
+        let until_expiry = caller
+            .expires_ms()
+            .map(|e| Duration::from_millis(e.saturating_sub(crate::store::now_ms())));
         tokio::select! {
             ev = rx.recv() => {
                 if let Err(tokio::sync::broadcast::error::RecvError::Closed) = ev {
@@ -904,7 +925,11 @@ fn change_msg(
 /// Encode a change event as an RFC 6902 JSON Patch relative to `sub`.
 /// `old_root` is the tree as of the previous event (or snapshot), letting us
 /// distinguish add/replace/remove and skip no-ops. None = nothing relevant.
-fn json_patch_event(sub: &Pointer, old_root: &Arc<crate::model::Node>, ev: &CommitEvent) -> Option<Value> {
+fn json_patch_event(
+    sub: &Pointer,
+    old_root: &Arc<crate::model::Node>,
+    ev: &CommitEvent,
+) -> Option<Value> {
     let mut targets = std::collections::BTreeSet::new();
     for c in ev.changed_paths.iter() {
         let Ok(c) = Pointer::parse(c) else { continue };
@@ -940,10 +965,15 @@ fn json_patch_event(sub: &Pointer, old_root: &Arc<crate::model::Node>, ev: &Comm
 }
 
 /// Encode a change event as an RFC 7396 JSON Merge Patch for the subtree.
-fn merge_patch_event(sub: &Pointer, old_root: &Arc<crate::model::Node>, ev: &CommitEvent) -> Option<Value> {
-    let relevant = ev.changed_paths.iter().any(|c| {
-        Pointer::parse(c).map(|c| sub.overlaps(&c)).unwrap_or(false)
-    });
+fn merge_patch_event(
+    sub: &Pointer,
+    old_root: &Arc<crate::model::Node>,
+    ev: &CommitEvent,
+) -> Option<Value> {
+    let relevant = ev
+        .changed_paths
+        .iter()
+        .any(|c| Pointer::parse(c).map(|c| sub.overlaps(&c)).unwrap_or(false));
     if !relevant {
         return None;
     }
@@ -1068,9 +1098,8 @@ fn subscribe_sse(
     let revoked: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         Box::pin(access_revoked(asker, ptr.clone()));
     let (snapshot, rx) = store.subscribe();
-    let still_current = last_seen.is_some_and(|v| {
-        v <= snapshot.version && snapshot.mods.last_modified(&ptr).version <= v
-    });
+    let still_current = last_seen
+        .is_some_and(|v| v <= snapshot.version && snapshot.mods.last_modified(&ptr).version <= v);
     let first = (!still_current).then(|| {
         Event::default()
             .event("snapshot")

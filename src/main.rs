@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing_subscriber::EnvFilter;
 use visijson::api;
 use visijson::store::{Store, StoreConfig};
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // unrestricted). Identity data lives in its own store under
     // DATA_DIR/sys, always fsync-durable — a lost session or grant
     // revocation must never come back after a crash.
-    let auth_on = matches!(std::env::var("AUTH").as_deref(), Ok("on") | Ok("1") | Ok("true"));
+    let auth_on = matches!(
+        std::env::var("AUTH").as_deref(),
+        Ok("on") | Ok("1") | Ok("true")
+    );
     let sys = auth_on
         .then(|| {
             Store::open(StoreConfig {
@@ -62,7 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let cfg = visijson::auth::AuthConfig {
                 session_ttl_ms: env_secs("SESSION_TTL_SECS", 7 * 24 * 3600) * 1000,
-                cookie_secure: matches!(std::env::var("COOKIE_SECURE").as_deref(), Ok("1") | Ok("true")),
+                cookie_secure: matches!(
+                    std::env::var("COOKIE_SECURE").as_deref(),
+                    Ok("1") | Ok("true")
+                ),
                 ..Default::default()
             };
             let (auth, bootstrap) = visijson::auth::Auth::open(sys.clone(), cfg)?;
@@ -97,7 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
     if snapshot_secs > 0 {
-        let snap_stores: Vec<Arc<Store>> = std::iter::once(store.clone()).chain(sys.clone()).collect();
+        let snap_stores: Vec<Arc<Store>> =
+            std::iter::once(store.clone()).chain(sys.clone()).collect();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(snapshot_secs));
             interval.tick().await; // first tick is immediate; skip it
@@ -126,7 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     if info_tick_secs > 0 {
-        api::spawn_info_ticker(info.clone(), store.clone(), Duration::from_secs(info_tick_secs));
+        api::spawn_info_ticker(
+            info.clone(),
+            store.clone(),
+            Duration::from_secs(info_tick_secs),
+        );
     }
 
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());

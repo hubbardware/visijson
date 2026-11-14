@@ -108,7 +108,8 @@ fn torn_wal_tail_is_tolerated() {
     // last WAL segment.
     let last = segment_paths(dir.path()).pop().expect("a WAL segment");
     let mut f = OpenOptions::new().append(true).open(last).unwrap();
-    f.write_all(b"{\"version\":3,\"ops\":[{\"op\":\"put\",\"pa").unwrap();
+    f.write_all(b"{\"version\":3,\"ops\":[{\"op\":\"put\",\"pa")
+        .unwrap();
     drop(f);
 
     let store = open(dir.path());
@@ -135,7 +136,10 @@ fn formulas_survive_recovery_and_keep_recomputing() {
 
     let store = open(dir.path());
     assert_eq!(store.get("/f").unwrap(), Some(json!(12)));
-    assert_eq!(store.get_raw("/f").unwrap().unwrap()["$formula"], json!("/a * 3"));
+    assert_eq!(
+        store.get_raw("/f").unwrap().unwrap()["$formula"],
+        json!("/a * 3")
+    );
     // Still live after recovery.
     store.put("/a", json!(10)).unwrap();
     assert_eq!(store.get("/f").unwrap(), Some(json!(30)));
@@ -283,7 +287,11 @@ fn all_durability_modes_recover_identically() {
         let store = open(dir.path());
         assert_eq!(store.version(), 3, "{durability:?}");
         assert_eq!(store.get("/a").unwrap(), Some(json!(2)), "{durability:?}");
-        assert_eq!(store.get("/b/c").unwrap(), Some(json!([1, 2])), "{durability:?}");
+        assert_eq!(
+            store.get("/b/c").unwrap(),
+            Some(json!([1, 2])),
+            "{durability:?}"
+        );
     }
 }
 
@@ -335,7 +343,9 @@ fn rebased_commits_equal_wal_replay() {
     // A formula depending on the shared region: writes there must decline
     // the rebase fast path and take the full replay route.
     store.put("/shared", json!({"k0": 0})).unwrap();
-    store.put("/calc/total", json!({"$formula": "sum(/shared)"})).unwrap();
+    store
+        .put("/calc/total", json!({"$formula": "sum(/shared)"}))
+        .unwrap();
 
     // Randomized concurrent Put/Merge: mostly per-thread subtrees (where
     // rebase applies), some contended/formula-covered writes (where it must
@@ -409,7 +419,11 @@ fn idle_snapshots_are_skipped() {
     drop(store);
     let store = open(dir.path());
     assert_eq!(store.snapshot().unwrap(), Some(2));
-    assert_eq!(store.stats().snapshots, 0, "restart rewrote an identical snapshot");
+    assert_eq!(
+        store.stats().snapshots,
+        0,
+        "restart rewrote an identical snapshot"
+    );
     // ...but WAL-replayed commits past the snapshot do trigger one.
     store.put("/c", json!(3)).unwrap();
     assert_eq!(store.snapshot().unwrap(), Some(3));

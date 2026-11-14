@@ -34,6 +34,8 @@ use serde_json::{json, Value};
 static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Every agent goes through here so every request carries the token.
+// ureq's middleware signature fixes the closure's error type.
+#[allow(clippy::result_large_err)]
 fn build_agent(builder: ureq::AgentBuilder) -> ureq::Agent {
     match TOKEN.get().cloned().flatten() {
         Some(token) => builder
@@ -117,7 +119,11 @@ fn apply_patch(root: &mut Value, exists: &mut bool, patch: &[Value]) -> Result<(
         }
         match (kind, &mut *cur) {
             ("add", Value::Array(a)) => {
-                let i = if last == "-" { a.len() } else { last.parse().map_err(|_| "bad index")? };
+                let i = if last == "-" {
+                    a.len()
+                } else {
+                    last.parse().map_err(|_| "bad index")?
+                };
                 if i > a.len() {
                     return Err("index out of range".into());
                 }
@@ -519,12 +525,19 @@ fn ui(f: &mut ratatui::Frame, app: &App, list_state: &mut ListState) {
             } else {
                 "▸ "
             };
-            let marker = if app.formulas.contains(&r.ptr) { "ƒ " } else { "" };
+            let marker = if app.formulas.contains(&r.ptr) {
+                "ƒ "
+            } else {
+                ""
+            };
             let line = Line::from(vec![
                 Span::raw("  ".repeat(r.depth)),
                 Span::raw(fold),
                 Span::styled(marker, Style::default().fg(Color::Magenta)),
-                Span::styled(r.label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    r.label.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled(r.preview.clone(), Style::default().fg(Color::DarkGray)),
             ]);
@@ -662,7 +675,10 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
                     }
                 } else {
                     Mode::Input {
-                        title: format!("add key = value under {}", if parent.is_empty() { "/doc" } else { &parent }),
+                        title: format!(
+                            "add key = value under {}",
+                            if parent.is_empty() { "/doc" } else { &parent }
+                        ),
                         buf: String::new(),
                         action: InputAction::AddToObject { parent },
                     }
@@ -674,7 +690,10 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
                     match fetch_raw(&app.agent, &app.base, &ptr) {
                         Ok((etag, _)) => {
                             app.mode = Mode::Confirm {
-                                prompt: format!("delete {}?", if ptr.is_empty() { "/doc" } else { &ptr }),
+                                prompt: format!(
+                                    "delete {}?",
+                                    if ptr.is_empty() { "/doc" } else { &ptr }
+                                ),
                                 ptr,
                                 etag,
                             }
@@ -692,7 +711,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
             }
             KeyCode::Char(c) => buf.push(c),
             KeyCode::Enter => {
-                let Mode::Input { buf, action, .. } = std::mem::replace(&mut app.mode, Mode::Browse)
+                let Mode::Input { buf, action, .. } =
+                    std::mem::replace(&mut app.mode, Mode::Browse)
                 else {
                     unreachable!()
                 };
@@ -716,8 +736,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
                     ),
                     InputAction::AddToObject { parent } => match buf.split_once('=') {
                         Some((key, value)) if !key.trim().is_empty() => {
-                            let ptr =
-                                format!("{parent}/{}", escape_token(key.trim()));
+                            let ptr = format!("{parent}/{}", escape_token(key.trim()));
                             send_guarded(
                                 &app.agent,
                                 "PUT",
@@ -738,7 +757,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
         },
         Mode::Confirm { .. } => match code {
             KeyCode::Char('y') => {
-                let Mode::Confirm { ptr, etag, .. } = std::mem::replace(&mut app.mode, Mode::Browse)
+                let Mode::Confirm { ptr, etag, .. } =
+                    std::mem::replace(&mut app.mode, Mode::Browse)
                 else {
                     unreachable!()
                 };
@@ -764,14 +784,18 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
 fn main() {
     let mut base = "http://127.0.0.1:8080".to_string();
     let mut check = false;
-    let mut token = std::env::var("VISIJSON_TOKEN").ok().filter(|t| !t.is_empty());
+    let mut token = std::env::var("VISIJSON_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--check" => check = true,
             "--token" => token = args.next(),
             "--help" | "-h" => {
-                println!("usage: visijson-tui [URL] [--check] [--token TOKEN]  (or VISIJSON_TOKEN)");
+                println!(
+                    "usage: visijson-tui [URL] [--check] [--token TOKEN]  (or VISIJSON_TOKEN)"
+                );
                 return;
             }
             other => base = other.trim_end_matches('/').to_string(),
@@ -790,7 +814,12 @@ fn main() {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-                Ok(Feed::Snapshot { version, exists, value, .. }) => {
+                Ok(Feed::Snapshot {
+                    version,
+                    exists,
+                    value,
+                    ..
+                }) => {
                     let keys = match &value {
                         Value::Object(m) => m.keys().cloned().collect::<Vec<_>>().join(", "),
                         other => other.to_string().chars().take(80).collect(),
@@ -872,8 +901,7 @@ mod tests {
 
     #[test]
     fn sse_frames_parse() {
-        let (name, id, data) =
-            parse_frame("event: change\nid: 7\ndata: {\"patch\":[]}").unwrap();
+        let (name, id, data) = parse_frame("event: change\nid: 7\ndata: {\"patch\":[]}").unwrap();
         assert_eq!((name.as_str(), id), ("change", Some(7)));
         assert_eq!(data["patch"], json!([]));
         assert!(parse_frame(": keep-alive").is_none());

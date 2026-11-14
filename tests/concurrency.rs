@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::thread;
 
-use visijson::store::Store;
 use serde_json::json;
+use visijson::store::Store;
 
 #[test]
 fn concurrent_transactional_increments_lose_no_updates() {
@@ -23,10 +23,7 @@ fn concurrent_transactional_increments_lose_no_updates() {
                 for _ in 0..INCREMENTS {
                     let (_, _, r) = store
                         .transaction(|txn| {
-                            let cur = txn
-                                .get("/counter")?
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
+                            let cur = txn.get("/counter")?.and_then(|v| v.as_i64()).unwrap_or(0);
                             txn.put("/counter", json!(cur + 1))?;
                             Ok(())
                         })

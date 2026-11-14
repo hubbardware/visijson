@@ -176,7 +176,9 @@ impl ModIndex {
     pub fn from_dump(d: &ModIndexDump) -> ModIndex {
         let mut entries = OrdMap::new();
         for (path, own_v, own_t, sub_v, sub_t) in &d.entries {
-            let Ok(p) = Pointer::parse(path) else { continue };
+            let Ok(p) = Pointer::parse(path) else {
+                continue;
+            };
             entries.insert(
                 p,
                 Entry {
@@ -265,7 +267,16 @@ mod tests {
             .record(Stamp::new(2, 200), [&p("/a/b/c")])
             .record(Stamp::new(3, 300), [&p("/x")]);
         let restored = ModIndex::from_dump(&idx.dump());
-        for probe in ["/a/b/c", "/a/b", "/a", "/a/b/c/deeper", "/a/b/other", "/x", "/z", ""] {
+        for probe in [
+            "/a/b/c",
+            "/a/b",
+            "/a",
+            "/a/b/c/deeper",
+            "/a/b/other",
+            "/x",
+            "/z",
+            "",
+        ] {
             assert_eq!(
                 restored.last_modified(&p(probe)),
                 idx.last_modified(&p(probe)),
