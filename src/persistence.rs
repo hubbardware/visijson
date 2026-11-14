@@ -186,6 +186,7 @@ impl Persistence {
         fs::create_dir_all(dir)?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(dir.join("LOCK"))?;
         lock.try_lock_exclusive().map_err(|e| {

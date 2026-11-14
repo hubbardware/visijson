@@ -34,6 +34,8 @@ use serde_json::{json, Value};
 static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Every agent goes through here so every request carries the token.
+// ureq's middleware signature fixes the closure's error type.
+#[allow(clippy::result_large_err)]
 fn build_agent(builder: ureq::AgentBuilder) -> ureq::Agent {
     match TOKEN.get().cloned().flatten() {
         Some(token) => builder
